@@ -593,7 +593,7 @@ class Volume2XYZ(nn.Module):
         self.threshold = params['threshold']
         self.device = params['device']
 
-        self.r = self.blob_r  # radius of the blob
+        self.r = int(round(float(self.blob_r)))  # radius of the blob
         self.maxpool = MaxPool3d(kernel_size=2 * self.r + 1, stride=1, padding=self.r)
         self.pad = ConstantPad3d(self.r, 0.0)
         self.zero = torch.FloatTensor([0.0]).to(self.device)
@@ -637,7 +637,7 @@ class Volume2XYZ(nn.Module):
         pred_thresh = torch.where(pred_vol > self.threshold, pred_vol, self.zero)
 
         # apply the 3D maxpooling to find local maxima
-        conf_vol = self.maxpool(pred_thresh)
+        conf_vol = self.maxpool(pred_thresh.unsqueeze(0))
         conf_vol = torch.where((conf_vol > self.zero) & (conf_vol == pred_thresh), conf_vol, self.zero)  # ~0.001s
         conf_vol = torch.squeeze(conf_vol)
         batch_indices = torch.nonzero(conf_vol, as_tuple=True)  # ~0.006s  indices of nonzero elements
