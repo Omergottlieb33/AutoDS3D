@@ -693,7 +693,7 @@ class MyDataset(Dataset):
 
         y = np.zeros(self.volume_size)
         y = np.pad(y, self.r)
-        xyz_ids, blob3d = self.labels[ID][0], self.labels[ID][1]
+        xyz_ids, blob3d = self.labels[ID]['xyz_ids'], self.labels[ID]['blob3d']
         for i in range(xyz_ids.shape[0]):
             xidx, yidx, zidx = xyz_ids[i, 0], xyz_ids[i, 1], xyz_ids[i, 2]
             y[zidx:zidx + 2 * self.r + 1, yidx:yidx + 2 * self.r + 1, xidx:xidx + 2 * self.r + 1] += blob3d[i]

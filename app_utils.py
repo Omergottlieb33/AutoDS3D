@@ -451,8 +451,8 @@ def training_func(param_dict, training_dict):
     print(f'# of trainable parameters: {n_params}')
 
     optimizer = Adam(list(model.parameters()), lr=lr)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=1, verbose=True,
-                                  min_lr=1e-6)  # verbose True
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=1,
+                                  min_lr=1e-6)
     if param_dict['us_factor'] == 1:
         # my_loss_func = torch.nn.MSELoss()
         my_loss_func = KDE_loss3D(sigma=0.5, device=device)
