@@ -59,7 +59,8 @@ def evaluate_model_on_aberration_pairs(training_results_path, test_data_dir, dev
         if not pt_files:
             raise FileNotFoundError(f"No .pt files found in {directory}")
         # Prefer files that start with 'net_' if present; otherwise pick latest by mtime
-        net_pt_files = [p for p in pt_files if os.path.basename(p).startswith('net_')]
+        net_pt_files = [
+            p for p in pt_files if os.path.basename(p).startswith('net_')]
         candidates = net_pt_files if net_pt_files else pt_files
         return max(candidates, key=os.path.getmtime)
 
@@ -70,7 +71,8 @@ def evaluate_model_on_aberration_pairs(training_results_path, test_data_dir, dev
         checkpoint = torch.load(checkpoint_path, map_location=device)
     except Exception:
         # Fallback for environments without safe globals or if loading still fails
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        checkpoint = torch.load(
+            checkpoint_path, map_location=device, weights_only=False)
     net = checkpoint['net']
     net.load_state_dict(checkpoint['state_dict'])
     net.to(device)
@@ -88,6 +90,12 @@ def evaluate_model_on_aberration_pairs(training_results_path, test_data_dir, dev
     param_dict_test_data['blob_r'] = blob_r
     param_dict_test_data['threshold'] = threshold
     volume2xyz = Volume2XYZ(param_dict_test_data)
+    # localizations results dataframe
+    localizations_clean_df = pd.DataFrame({'Image': pd.Series(dtype='string'),
+                                     'x': pd.Series(dtype='float64'),
+                                     'y': pd.Series(dtype='float64'),
+                                     'z': pd.Series(dtype='float64')})
+    localizations_abr_df = localizations_clean_df.copy()
     # evaluate
     results_df_clean = pd.DataFrame({
         'Image': pd.Series(dtype='string'),
@@ -114,6 +122,14 @@ def evaluate_model_on_aberration_pairs(training_results_path, test_data_dir, dev
         with torch.no_grad():
             volume_pred_clean = net(im_tensor).to(device)
         xyz_pred_clean, _ = volume2xyz(volume_pred_clean)
+        if xyz_pred_clean is not None:
+            localizations_clean_df = pd.concat([localizations_clean_df, pd.DataFrame({
+                'Image': [img_name]*len(xyz_pred_clean),
+                'x': xyz_pred_clean[:, 0],
+                'y': xyz_pred_clean[:, 1],
+                'z': xyz_pred_clean[:, 2],
+            })], ignore_index=True)
+
         jaccard_clean, rmse_xy_clean, rmse_z_clean, _ = calc_jaccard_rmse(
             xyz_gt, xyz_pred_clean, jaccard_threshold)
         results_df_clean = pd.concat([results_df_clean, pd.DataFrame({
@@ -126,6 +142,13 @@ def evaluate_model_on_aberration_pairs(training_results_path, test_data_dir, dev
             with torch.no_grad():
                 volume_pred_abr = net(im_tensor_abr)
             xyz_pred_abr, _ = volume2xyz(volume_pred_abr)
+            if xyz_pred_abr is not None:
+                localizations_abr_df = pd.concat([localizations_abr_df, pd.DataFrame({
+                    'Image': [img_name+'_abr']*len(xyz_pred_abr),
+                    'x': xyz_pred_abr[:, 0],
+                    'y': xyz_pred_abr[:, 1],
+                    'z': xyz_pred_abr[:, 2],
+                })], ignore_index=True)
             jaccard_abr, rmse_xy_abr, rmse_z_abr, _ = calc_jaccard_rmse(
                 xyz_gt, xyz_pred_abr, jaccard_threshold)
             results_df_aberrated = pd.concat([results_df_aberrated, pd.DataFrame({
@@ -134,7 +157,12 @@ def evaluate_model_on_aberration_pairs(training_results_path, test_data_dir, dev
                 'RMSE_xy (nm)': [rmse_xy_abr],
                 'RMSE_z (nm)': [rmse_z_abr],
             })], ignore_index=True)
-    # save results
+    # save localizations
+    localizations_clean_df.to_csv(os.path.join(
+        training_results_path, 'localizations_clean.csv'), index=False)
+    localizations_abr_df.to_csv(os.path.join(
+        training_results_path, 'localizations_aberrated.csv'), index=False)
+    # save evaluation results
     results_df_clean.to_csv(os.path.join(
         training_results_path, 'results_clean.csv'), index=False)
     results_df_aberrated.to_csv(os.path.join(
