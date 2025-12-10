@@ -48,23 +48,32 @@ def get_image_and_aberrated_tensors(images_path: str, img_name: str, param_dict:
     return im_tensor, im_tensor_abr
 
 
+def get_image_tensor(images_path: str, img_name: str, param_dict: dict):
+    img_path = os.path.join(images_path, img_name)
+    im = imread(img_path)
+    im = im[np.newaxis, :, :].astype(np.float32)
+    if param_dict['project_01']:
+        im = ((im - im.min()) / (im.max() - im.min())).astype(np.float32)
+    im_tensor = torch.from_numpy(im).unsqueeze(0).to(param_dict['device'])
+    return im_tensor
+
+
+def find_latest_pt_file(directory: str) -> str:
+    pt_files = [os.path.join(directory, f)
+                for f in os.listdir(directory) if f.endswith('.pt')]
+    if not pt_files:
+        raise FileNotFoundError(f"No .pt files found in {directory}")
+    # Prefer files that start with 'net_' if present; otherwise pick latest by mtime
+    net_pt_files = [
+        p for p in pt_files if os.path.basename(p).startswith('net_')]
+    candidates = net_pt_files if net_pt_files else pt_files
+    return max(candidates, key=os.path.getmtime)
+
+
 def evaluate_model_on_aberration_pairs(training_results_path, test_data_dir, device, blob_r, threshold, jaccard_threshold):
     # load trained model
-    def _find_latest_pt_file(directory: str) -> str:
-        pt_files = [
-            os.path.join(directory, f)
-            for f in os.listdir(directory)
-            if f.endswith('.pt')
-        ]
-        if not pt_files:
-            raise FileNotFoundError(f"No .pt files found in {directory}")
-        # Prefer files that start with 'net_' if present; otherwise pick latest by mtime
-        net_pt_files = [
-            p for p in pt_files if os.path.basename(p).startswith('net_')]
-        candidates = net_pt_files if net_pt_files else pt_files
-        return max(candidates, key=os.path.getmtime)
 
-    checkpoint_path = _find_latest_pt_file(training_results_path)
+    checkpoint_path = find_latest_pt_file(training_results_path)
     # Allowlist the model class for secure unpickling on PyTorch >= 2.6
     try:
         torch.serialization.add_safe_globals([Net])
@@ -92,9 +101,9 @@ def evaluate_model_on_aberration_pairs(training_results_path, test_data_dir, dev
     volume2xyz = Volume2XYZ(param_dict_test_data)
     # localizations results dataframe
     localizations_clean_df = pd.DataFrame({'Image': pd.Series(dtype='string'),
-                                     'x': pd.Series(dtype='float64'),
-                                     'y': pd.Series(dtype='float64'),
-                                     'z': pd.Series(dtype='float64')})
+                                           'x': pd.Series(dtype='float64'),
+                                           'y': pd.Series(dtype='float64'),
+                                           'z': pd.Series(dtype='float64')})
     localizations_abr_df = localizations_clean_df.copy()
     # evaluate
     results_df_clean = pd.DataFrame({
@@ -169,7 +178,80 @@ def evaluate_model_on_aberration_pairs(training_results_path, test_data_dir, dev
         training_results_path, 'results_aberrated.csv'), index=False)
 
 
+def evaluate_model(training_results_path, test_data_dir, device, blob_r, threshold, jaccard_threshold):
+    # load trained model
+    checkpoint_path = find_latest_pt_file(training_results_path)
+    # Allowlist the model class for secure unpickling on PyTorch >= 2.6
+    try:
+        torch.serialization.add_safe_globals([Net])
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+    except Exception:
+        # Fallback for environments without safe globals or if loading still fails
+        checkpoint = torch.load(
+            checkpoint_path, map_location=device, weights_only=False)
+    net = checkpoint['net']
+    net.load_state_dict(checkpoint['state_dict'])
+    net.to(device)
+    net.eval()
+
+    # load test data
+    with open(os.path.join(test_data_dir, 'y.pickle'), 'rb') as handle:
+        localizations = pickle.load(handle)
+    x_folder = os.path.join(test_data_dir, 'x')
+    with open(os.path.join(test_data_dir, 'param.pickle'), 'rb') as handle:
+        param_dict_test_data = pickle.load(handle)
+    sorted_img_names = sorted(os.listdir(
+        x_folder), key=lambda x: int(os.path.splitext(x)[0]))
+    param_dict_test_data['device'] = device
+    param_dict_test_data['blob_r'] = blob_r
+    param_dict_test_data['threshold'] = threshold
+    volume2xyz = Volume2XYZ(param_dict_test_data)
+    # localizations results dataframe
+    localizations_df = pd.DataFrame({'Image': pd.Series(dtype='string'),
+                                     'x': pd.Series(dtype='float64'),
+                                     'y': pd.Series(dtype='float64'),
+                                     'z': pd.Series(dtype='float64')})
+    # evaluate
+    results_df = pd.DataFrame({
+        'Image': pd.Series(dtype='string'),
+        'Jaccard Index': pd.Series(dtype='float64'),
+        'RMSE_xy (nm)': pd.Series(dtype='float64'),
+        'RMSE_z (nm)': pd.Series(dtype='float64'),
+    })
+    for img_name in sorted_img_names:
+        xyzps_gt = localizations[img_name]
+        xyz_gt = xyzps_gt['xyzps'][:, :-1]
+        # tensors
+        im_tensor = get_image_tensor(
+            x_folder, img_name, param_dict_test_data)
+        with torch.no_grad():
+            volume_pred_clean = net(im_tensor).to(device)
+        xyz_pred_clean, _ = volume2xyz(volume_pred_clean)
+        if xyz_pred_clean is not None:
+            localizations_df = pd.concat([localizations_df, pd.DataFrame({
+                'Image': [img_name]*len(xyz_pred_clean),
+                'x': xyz_pred_clean[:, 0],
+                'y': xyz_pred_clean[:, 1],
+                'z': xyz_pred_clean[:, 2],
+            })], ignore_index=True)
+
+        jaccard_clean, rmse_xy_clean, rmse_z_clean, _ = calc_jaccard_rmse(
+            xyz_gt, xyz_pred_clean, jaccard_threshold)
+        results_df = pd.concat([results_df, pd.DataFrame({
+            'Image': [img_name],
+            'Jaccard Index': [jaccard_clean],
+            'RMSE_xy (nm)': [rmse_xy_clean],
+            'RMSE_z (nm)': [rmse_z_clean],
+        })], ignore_index=True)
+    # save localizations
+    localizations_df.to_csv(os.path.join(
+        training_results_path, 'localizations.csv'), index=False)
+    # save evaluation results
+    results_df.to_csv(os.path.join(
+        training_results_path, 'results.csv'), index=False)
+
+
 if __name__ == "__main__":
     args = get_args()
-    evaluate_model_on_aberration_pairs(args.training_results_path, args.test_data_dir,
-                                       args.device, args.blob_r, args.threshold, args.jaccard_threshold)
+    evaluate_model(args.training_results_path, args.test_data_dir,
+                   args.device, args.blob_r, args.threshold, args.jaccard_threshold)
