@@ -7,14 +7,21 @@ import numpy as np
 import pandas as pd
 from DS3Dplus.ds3d_utils import ImModelBase, ImModelTraining, Sampling, calc_jaccard_rmse, Volume2XYZ
 from DS3Dplus.ds3d_utils import LON as Net
+from tqdm import tqdm
 
 
 def get_args():
     parser = argparse.ArgumentParser(description="Evaluate DS3D+ model")
     parser.add_argument('--training_results_path', type=str,
                         required=True, help='Path to the evaluation data')
-    parser.add_argument('--test_data_dir', type=str,
-                        help='Path to the test data')
+    parser.add_argument('--labels_path', type=str,
+                        help='Path to the labels data'),
+    parser.add_argument('--imgs_path', type=str,
+                        help='Path to the images data'),
+    parser.add_argument('--params_path', type=str,
+                        help='Path to the parameters data'),
+    parser.add_argument('--exp_name', type=str, default='test',
+                        help='Experiment name for evaluation')
     parser.add_argument('--device', type=str, default='cuda:2',
                         help='Device to use for evaluation (cuda or cpu)')
     parser.add_argument('--blob_r', type=float, default=2.0,
@@ -58,6 +65,10 @@ def get_image_tensor(images_path: str, img_name: str, param_dict: dict):
     return im_tensor
 
 
+def get_subfolders(directory: str) -> list:
+    return [d for d in os.listdir(directory) if os.path.isdir(os.path.join(directory, d))]
+
+
 def find_latest_pt_file(directory: str) -> str:
     pt_files = [os.path.join(directory, f)
                 for f in os.listdir(directory) if f.endswith('.pt')]
@@ -88,6 +99,7 @@ def evaluate_model_on_aberration_pairs(training_results_path, test_data_dir, dev
     net.eval()
 
     # load test data
+    sub_folders = get_subfolders(test_data_dir)
     with open(os.path.join(test_data_dir, 'y.pickle'), 'rb') as handle:
         localizations = pickle.load(handle)
     x_folder = os.path.join(test_data_dir, 'x/orig')
@@ -178,7 +190,7 @@ def evaluate_model_on_aberration_pairs(training_results_path, test_data_dir, dev
         training_results_path, 'results_aberrated.csv'), index=False)
 
 
-def evaluate_model(training_results_path, test_data_dir, device, blob_r, threshold, jaccard_threshold):
+def evaluate_model(training_results_path, labels_path, imgs_path, params_path,exp_name, device, blob_r, threshold, jaccard_threshold):
     # load trained model
     checkpoint_path = find_latest_pt_file(training_results_path)
     # Allowlist the model class for secure unpickling on PyTorch >= 2.6
@@ -195,10 +207,10 @@ def evaluate_model(training_results_path, test_data_dir, device, blob_r, thresho
     net.eval()
 
     # load test data
-    with open(os.path.join(test_data_dir, 'y.pickle'), 'rb') as handle:
+    with open(labels_path, 'rb') as handle:
         localizations = pickle.load(handle)
-    x_folder = os.path.join(test_data_dir, 'x')
-    with open(os.path.join(test_data_dir, 'param.pickle'), 'rb') as handle:
+    x_folder = imgs_path
+    with open(params_path, 'rb') as handle:
         param_dict_test_data = pickle.load(handle)
     sorted_img_names = sorted(os.listdir(
         x_folder), key=lambda x: int(os.path.splitext(x)[0]))
@@ -218,8 +230,10 @@ def evaluate_model(training_results_path, test_data_dir, device, blob_r, thresho
         'RMSE_xy (nm)': pd.Series(dtype='float64'),
         'RMSE_z (nm)': pd.Series(dtype='float64'),
     })
-    for img_name in sorted_img_names:
+    for img_name in tqdm(sorted_img_names):
         xyzps_gt = localizations[img_name]
+        if xyzps_gt['abr_rmse'] is None:
+                continue
         xyz_gt = xyzps_gt['xyzps'][:, :-1]
         # tensors
         im_tensor = get_image_tensor(
@@ -243,15 +257,26 @@ def evaluate_model(training_results_path, test_data_dir, device, blob_r, thresho
             'RMSE_xy (nm)': [rmse_xy_clean],
             'RMSE_z (nm)': [rmse_z_clean],
         })], ignore_index=True)
+    save_path = os.path.join(training_results_path, 'evaluation_results')
+    os.makedirs(save_path, exist_ok=True)
+
     # save localizations
     localizations_df.to_csv(os.path.join(
-        training_results_path, 'localizations.csv'), index=False)
+        save_path, f'localizations_{exp_name}.csv'), index=False)
     # save evaluation results
     results_df.to_csv(os.path.join(
-        training_results_path, 'results.csv'), index=False)
+        save_path, f'results_{exp_name}.csv'), index=False)
+    
+    mean_jaccard = results_df['Jaccard Index'].mean()
+    mean_rmse_xy = results_df['RMSE_xy (nm)'].mean()
+    mean_rmse_z = results_df['RMSE_z (nm)'].mean()
+    print(f"Evaluation results for experiment '{exp_name}':")
+    print(f"Mean Jaccard Index: {mean_jaccard:.4f}")
+    print(f"Mean RMSE_xy (nm): {mean_rmse_xy:.4f}")
+    print(f"Mean RMSE_z (nm): {mean_rmse_z:.4f}")
 
 
 if __name__ == "__main__":
     args = get_args()
-    evaluate_model(args.training_results_path, args.test_data_dir,
+    evaluate_model(args.training_results_path, args.labels_path, args.imgs_path, args.params_path, args.exp_name,
                    args.device, args.blob_r, args.threshold, args.jaccard_threshold)
