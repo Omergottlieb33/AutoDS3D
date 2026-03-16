@@ -15,14 +15,14 @@ def get_args():
     parser.add_argument('--training_results_path', type=str,
                         required=True, help='Path to the evaluation data')
     parser.add_argument('--labels_path', type=str,
-                        help='Path to the labels data'),
+                        help='Path to the labels data')
     parser.add_argument('--imgs_path', type=str,
-                        help='Path to the images data'),
+                        help='Path to the images data')
     parser.add_argument('--params_path', type=str,
-                        help='Path to the parameters data'),
+                        help='Path to the parameters data')
     parser.add_argument('--exp_name', type=str, default='test',
                         help='Experiment name for evaluation')
-    parser.add_argument('--device', type=str, default='cuda:2',
+    parser.add_argument('--device', type=str, default='cuda:1',
                         help='Device to use for evaluation (cuda or cpu)')
     parser.add_argument('--blob_r', type=float, default=2.0,
                         help='Blob radius for evaluation')

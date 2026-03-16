@@ -44,7 +44,9 @@ def load_model(checkpoints_path: str, device: torch.device):
     net.eval()
     return net
 
-def inference(checkpoints_path: str, device: torch.device, images_path: str, params_path: str, save_path: str):
+def inference(checkpoints_path: str, device: torch.device, images_path: str, params_path: str, save_path: str, save_frame_csv: bool = False):
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    # load model
     model = load_model(checkpoints_path, device)
     # load parameters
     with open(params_path, 'rb') as f:
@@ -87,10 +89,18 @@ def inference(checkpoints_path: str, device: torch.device, images_path: str, par
                 xyz_save = np.c_[xnm, ynm, znm]
                 
                 results = np.vstack((results, np.column_stack((frm_rec, xyz_save, conf_rec))))
-                if idx % (num_imgs // 10) == 0:
+                log_interval = max(1, num_imgs // 10)
+                if idx % log_interval == 0:
                     print('Processed Image [%d/%d]' % (idx + 1, num_imgs))
                     # print status
                     print('Single frame complete in found {:d} emitters'.format(nemitters))
+                if save_frame_csv:
+                    frame_csv_path = os.path.join(os.path.dirname(save_path), f'{img_name.split(".")[0]}.csv')
+                    with open(frame_csv_path, 'w', newline='') as frame_file:
+                        frame_writer = csv.writer(frame_file)
+                        frame_writer.writerow(['x [nm]', 'y [nm]', 'z [nm]', 'intensity [au]'])
+                        frame_writer.writerows(np.column_stack((xnm, ynm, znm, conf_rec)).tolist())
+                    print(f'{frame_csv_path} is saved.')
     # save results
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     with open(save_path, 'w', newline='') as file:
@@ -101,4 +111,4 @@ def inference(checkpoints_path: str, device: torch.device, images_path: str, par
 if  __name__ == "__main__":
     args = get_args()
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-    inference(args.checkpoints_path, device, args.images_path, args.params_path, args.save_path)
+    inference(args.checkpoints_path, device, args.images_path, args.params_path, args.save_path, True)
