@@ -8,6 +8,7 @@ import os
 import shutil
 import pickle
 from scipy import ndimage
+from scipy.spatial import cKDTree
 from datetime import datetime
 import torch
 import torch.fft as fft
@@ -21,6 +22,56 @@ from DS3Dplus.ds3d_utils import ImModel, Sampling, MyDataset, Volume2XYZ, calc_j
 from DS3Dplus.ds3d_utils import LON as Net
 from DS3Dplus.training_utils import TorchTrainer
 import matplotlib.pyplot as plt
+
+
+def calculate_localization_centers(localizations, radius):
+    """Group nearby localizations and return one center point per group.
+
+    Localizations are connected when their Euclidean distance is at most
+    ``radius``. The center of each connected group is the arithmetic mean of
+    the group's coordinates.
+
+    Args:
+        localizations: Array-like of shape ``(n_points, n_dims)``.
+        radius: Non-negative distance threshold for grouping.
+
+    Returns:
+        A ``(n_groups, n_dims)`` NumPy array with one center per group.
+    """
+    localizations = np.asarray(localizations, dtype=np.float64)
+
+    if localizations.ndim != 2:
+        raise ValueError('localizations must have shape (n_points, n_dims).')
+    if radius < 0:
+        raise ValueError('radius must be non-negative.')
+    if localizations.shape[0] == 0:
+        return np.empty((0, localizations.shape[1]), dtype=np.float64)
+
+    tree = cKDTree(localizations)
+    visited = np.zeros(localizations.shape[0], dtype=bool)
+    centers = []
+
+    for start_idx in range(localizations.shape[0]):
+        if visited[start_idx]:
+            continue
+
+        component = []
+        stack = [start_idx]
+        visited[start_idx] = True
+
+        while stack:
+            current_idx = stack.pop()
+            component.append(current_idx)
+            neighbor_indices = tree.query_ball_point(localizations[current_idx], radius)
+
+            for neighbor_idx in neighbor_indices:
+                if not visited[neighbor_idx]:
+                    visited[neighbor_idx] = True
+                    stack.append(neighbor_idx)
+
+        centers.append(localizations[component].mean(axis=0))
+
+    return np.vstack(centers)
 
 
 class ImModel_pr(nn.Module):
@@ -288,40 +339,36 @@ def show_z_psf(param_dict):
 def background_removal(im_folder, num=100):
     save_folder = im_folder + '_br'  # where to save the images after background removal
 
-    if os.path.exists(save_folder):
+    if os.path.exists(save_folder) and len(os.listdir(save_folder)) > 0:
         print('probably has been done!')
     else:
-        os.makedirs(save_folder)
+        if not os.path.exists(save_folder):
+            os.makedirs(save_folder)
 
-        im_files = sorted(os.listdir(im_folder))  # make sure the names are sortable
+        if num <= 0:
+            raise ValueError('num must be a positive integer.')
+
+        # Read only real image files to avoid passing folders to skimage.io.imread.
+        valid_exts = {'.tif', '.tiff', '.png', '.jpg', '.jpeg', '.bmp'}
+        im_files = sorted([
+            name for name in os.listdir(im_folder)
+            if os.path.isfile(os.path.join(im_folder, name))
+            and os.path.splitext(name)[1].lower() in valid_exts
+        ])
+
         n_ims = len(im_files)
-        if n_ims > num:
-            pointer = 0
-            for i in range(n_ims//num):
-                im_names = [im_files[pointer+j] for j in range(num)]
-                im_stack = [io.imread(os.path.join(im_folder, im_files[pointer+j])) for j in range(num)]
-                pointer += num
-                im_stack = np.array(im_stack)
-                im_stack = im_stack-np.min(im_stack, axis=0)
 
-                for j in range(num):  # save
-                    io.imsave(os.path.join(save_folder, im_names[j]), im_stack[j], check_contrast=False)
+        if n_ims == 0:
+            raise ValueError(f'No supported image files found in: {im_folder}')
 
-            # remainder of n_ims/num
-            im_stack = [io.imread(os.path.join(im_folder, im_files[-j])) for j in range(num)]
-            im_stack = np.array(im_stack)
-            im_min = np.min(im_stack, axis=0)
-            for j in range(pointer, n_ims):
-                im = io.imread(os.path.join(im_folder, im_files[j]))
-                im = im-im_min
-                io.imsave(os.path.join(save_folder, im_files[j]), im, check_contrast=False)
+        # Process in chunks and subtract per-pixel minimum in each chunk.
+        for start in range(0, n_ims, num):
+            im_names = im_files[start:start + num]
+            im_stack = np.array([io.imread(os.path.join(im_folder, name)) for name in im_names])
+            im_stack = im_stack - np.min(im_stack, axis=0)
 
-        else:
-            im_stack = [io.imread(os.path.join(im_folder, im_files[j])) for j in range(n_ims)]
-            im_stack = np.array(im_stack)
-            im_stack = im_stack-np.min(im_stack, axis=0)
-            for j in range(n_ims):
-                io.imsave(os.path.join(save_folder, im_files[j]), im_stack[j], check_contrast=False)
+            for j, im_name in enumerate(im_names):
+                io.imsave(os.path.join(save_folder, im_name), im_stack[j], check_contrast=False)
 
     return save_folder
 
