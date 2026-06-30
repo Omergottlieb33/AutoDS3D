@@ -9,6 +9,8 @@ import shutil
 import pickle
 from scipy import ndimage
 from scipy.spatial import cKDTree
+from scipy.spatial.distance import cdist
+from scipy.optimize import linear_sum_assignment
 from datetime import datetime
 import torch
 import torch.fft as fft
@@ -24,54 +26,7 @@ from DS3Dplus.training_utils import TorchTrainer
 import matplotlib.pyplot as plt
 
 
-def calculate_localization_centers(localizations, radius):
-    """Group nearby localizations and return one center point per group.
 
-    Localizations are connected when their Euclidean distance is at most
-    ``radius``. The center of each connected group is the arithmetic mean of
-    the group's coordinates.
-
-    Args:
-        localizations: Array-like of shape ``(n_points, n_dims)``.
-        radius: Non-negative distance threshold for grouping.
-
-    Returns:
-        A ``(n_groups, n_dims)`` NumPy array with one center per group.
-    """
-    localizations = np.asarray(localizations, dtype=np.float64)
-
-    if localizations.ndim != 2:
-        raise ValueError('localizations must have shape (n_points, n_dims).')
-    if radius < 0:
-        raise ValueError('radius must be non-negative.')
-    if localizations.shape[0] == 0:
-        return np.empty((0, localizations.shape[1]), dtype=np.float64)
-
-    tree = cKDTree(localizations)
-    visited = np.zeros(localizations.shape[0], dtype=bool)
-    centers = []
-
-    for start_idx in range(localizations.shape[0]):
-        if visited[start_idx]:
-            continue
-
-        component = []
-        stack = [start_idx]
-        visited[start_idx] = True
-
-        while stack:
-            current_idx = stack.pop()
-            component.append(current_idx)
-            neighbor_indices = tree.query_ball_point(localizations[current_idx], radius)
-
-            for neighbor_idx in neighbor_indices:
-                if not visited[neighbor_idx]:
-                    visited[neighbor_idx] = True
-                    stack.append(neighbor_idx)
-
-        centers.append(localizations[component].mean(axis=0))
-
-    return np.vstack(centers)
 
 
 class ImModel_pr(nn.Module):
@@ -773,6 +728,23 @@ def inference_func2(param_dict):
     return file_name
 
 
+def match_localizations_hungarian(locs_a, locs_b, max_distance=None):
+    """Match two sets of localizations with the Hungarian algorithm and return mean distance.
 
+    Args:
+        locs_a: (N, D) array of localizations in nm.
+        locs_b: (M, D) array of localizations in nm.
+        max_distance: optional distance cutoff (nm); matched pairs beyond this are excluded.
+
+    Returns:
+        mean_dist: mean Euclidean distance of matched pairs in nm.
+        dists: (K,) array of individual matched distances after filtering.
+    """
+    C = cdist(locs_a, locs_b, metric='euclidean')
+    row_ind, col_ind = linear_sum_assignment(C)
+    dists = C[row_ind, col_ind]
+    if max_distance is not None:
+        dists = dists[dists <= max_distance]
+    return float(np.mean(dists)), dists
 
 
