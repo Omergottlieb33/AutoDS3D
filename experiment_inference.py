@@ -22,10 +22,13 @@ def get_args():
                         help='Path to the parameters file used during training.')
     parser.add_argument('--save_path', type=str, required=True,
                         help='Path to save the inference results (CSV file).')
-    parser.add_argument('--patch_size', type=int, default=120,
-                        help='Size of the sliding window patch (e.g. 128).')
-    parser.add_argument('--overlap', type=int, default=16,
-                        help='Overlap size between patches (e.g. 16).')
+    parser.add_argument('--threshold', type=float, default=80,
+                        help='Detection threshold on the predicted volume, in units of '
+                             'blob_maxv (1000). Sweep this rather than trusting the default.')
+    parser.add_argument('--border', type=int, default=0,
+                        help='Discard localizations within this many pixels of the image '
+                             'edge. The network never sees emitters inside the psf_half_size '
+                             'buffer (20 px) during training, so that band is extrapolation.')
     return parser.parse_args()
 
 def load_model(checkpoints_path: str, device: torch.device):
@@ -44,7 +47,7 @@ def load_model(checkpoints_path: str, device: torch.device):
     net.eval()
     return net
 
-def inference(checkpoints_path: str, device: torch.device, images_path: str, params_path: str, save_path: str, save_frame_csv: bool = False):
+def inference(checkpoints_path: str, device: torch.device, images_path: str, params_path: str, save_path: str, save_frame_csv: bool = False, threshold: float = 40, border: int = 0):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     # load model
     model = load_model(checkpoints_path, device)
@@ -52,7 +55,7 @@ def inference(checkpoints_path: str, device: torch.device, images_path: str, par
     with open(params_path, 'rb') as f:
         params = pickle.load(f)
     params['device'] = device
-    params['threshold'] = 40  # set a fixed threshold for inference
+    params['threshold'] = threshold
     volume2xyz = Volume2XYZ(params)
     ps_xy = params['vs_xy']*params['us_factor']
     #ps_xy = params['ps_xy'] # FOV size, camera pixel size/magnification
@@ -63,8 +66,10 @@ def inference(checkpoints_path: str, device: torch.device, images_path: str, par
         print("Filenames are not integers. Sorting alphabetically.")
         sorted_img_names = sorted(img_files)
     num_imgs = len(sorted_img_names)
-    results = np.array(['frame', 'x [nm]', 'y [nm]', 'z [nm]', 'intensity [au]'])
-    with torch.no_grad():
+    log_interval = max(1, num_imgs // 10)
+    with open(save_path, 'w', newline='') as result_file, torch.no_grad():
+        writer = csv.writer(result_file)
+        writer.writerow(['frame', 'x [nm]', 'y [nm]', 'z [nm]', 'intensity [au]'])
         for idx, img_name in tqdm(enumerate(sorted_img_names)):
             im = imread(os.path.join(images_path, img_name)).astype(np.float32)
             if params['project_01']:
@@ -80,35 +85,37 @@ def inference(checkpoints_path: str, device: torch.device, images_path: str, par
             if xyz_rec is None:
                 nemitters = 0
             else:
-                nemitters = xyz_rec.shape[0]
-                frm_rec = (idx + 1) * np.ones(nemitters)
-                
                 xnm = (xyz_rec[:, 0] + cw * ps_xy) * 1000
                 ynm = (xyz_rec[:, 1] + ch * ps_xy) * 1000
                 znm = (xyz_rec[:, 2]) * 1000
+
+                if border > 0:
+                    # keep only detections at least `border` px from the edge
+                    keep = ((xnm / (ps_xy * 1000) >= border) & (xnm / (ps_xy * 1000) <= W - border) &
+                            (ynm / (ps_xy * 1000) >= border) & (ynm / (ps_xy * 1000) <= H - border))
+                    xnm, ynm, znm, conf_rec = xnm[keep], ynm[keep], znm[keep], conf_rec[keep]
+
+                nemitters = xnm.shape[0]
+                frm_rec = (idx + 1) * np.ones(nemitters)
                 xyz_save = np.c_[xnm, ynm, znm]
-                
-                results = np.vstack((results, np.column_stack((frm_rec, xyz_save, conf_rec))))
-                log_interval = max(1, num_imgs // 10)
-                if idx % log_interval == 0:
-                    print('Processed Image [%d/%d]' % (idx + 1, num_imgs))
-                    # print status
-                    print('Single frame complete in found {:d} emitters'.format(nemitters))
+
+                writer.writerows(np.column_stack((frm_rec, xyz_save, conf_rec)).tolist())
+
                 if save_frame_csv:
                     frame_csv_path = os.path.join(os.path.dirname(save_path), f'{img_name.split(".")[0]}.csv')
                     with open(frame_csv_path, 'w', newline='') as frame_file:
                         frame_writer = csv.writer(frame_file)
                         frame_writer.writerow(['x [nm]', 'y [nm]', 'z [nm]', 'intensity [au]'])
                         frame_writer.writerows(np.column_stack((xnm, ynm, znm, conf_rec)).tolist())
-                    print(f'{frame_csv_path} is saved.')
-    # save results
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    with open(save_path, 'w', newline='') as file:
-        writer = csv.writer(file)
-        writer.writerows(results.tolist())
+
+            if idx % log_interval == 0:
+                print('Processed Image [%d/%d]' % (idx + 1, num_imgs))
+                # print status
+                print('Single frame complete in found {:d} emitters'.format(nemitters))
     print(f'{save_path} is saved.')
 
 if  __name__ == "__main__":
     args = get_args()
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-    inference(args.checkpoints_path, device, args.images_path, args.params_path, args.save_path, True)
+    inference(args.checkpoints_path, device, args.images_path, args.params_path, args.save_path,
+              threshold=args.threshold, border=args.border)

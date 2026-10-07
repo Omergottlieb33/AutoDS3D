@@ -232,8 +232,8 @@ def evaluate_model(training_results_path, labels_path, imgs_path, params_path,ex
     })
     for img_name in tqdm(sorted_img_names):
         xyzps_gt = localizations[img_name]
-        if xyzps_gt['abr_rmse'] is None:
-                continue
+        # if xyzps_gt['abr_rmse'] is None:
+        #         continue
         xyz_gt = xyzps_gt['xyzps'][:, :-1]
         # tensors
         im_tensor = get_image_tensor(

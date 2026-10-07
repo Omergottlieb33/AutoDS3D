@@ -26,6 +26,9 @@ from DS3Dplus.training_utils import TorchTrainer
 import matplotlib.pyplot as plt
 
 
+def out_path(param_dict, file_name):
+    """Path of a product file inside the user-selected output folder."""
+    return os.path.join(param_dict.get('output_dir', os.getcwd()), file_name)
 
 
 
@@ -279,7 +282,7 @@ def phase_retrieval(param_dict, pr_dict, fig_flag=True):
         ax.set_ylabel('CC')
         # ax.set_title('model accuracy')
 
-        plt.savefig('phase_retrieval_results.jpg', bbox_inches='tight', dpi=300)
+        plt.savefig(out_path(param_dict, 'phase_retrieval_results.jpg'), bbox_inches='tight', dpi=300)
         plt.clf()
         # print(f'phase retrieval results: phase_retrieval_results.jpg')
 
@@ -291,8 +294,10 @@ def show_z_psf(param_dict):
     model.model_demo(np.linspace(param_dict['zrange'][0], param_dict['zrange'][1], 5))  # check PSFs
 
 
-def background_removal(im_folder, num=100):
-    save_folder = im_folder + '_br'  # where to save the images after background removal
+def background_removal(im_folder, save_folder=None, num=100):
+    if save_folder is None:
+        save_folder = im_folder + '_br'  # where to save the images after background removal
+    os.makedirs(os.path.dirname(os.path.normpath(save_folder)), exist_ok=True)
 
     if os.path.exists(save_folder) and len(os.listdir(save_folder)) > 0:
         print('probably has been done!')
@@ -425,8 +430,7 @@ def training_func(param_dict, training_dict):
 
     td_folder = param_dict['td_folder']
     path_save = param_dict['path_save']
-    if not (os.path.isdir(path_save)):
-        os.mkdir(path_save)
+    os.makedirs(path_save, exist_ok=True)
 
     batch_size = training_dict['batch_size']
     lr = training_dict['lr']
@@ -509,10 +513,11 @@ def inference_func1(param_dict, test_idx, fig_flag=True):  # simulation and try 
         plt.xlabel('epoch')
         plt.ylabel('loss')
         plt.grid()
-        plt.savefig('loss_curves.jpg', bbox_inches='tight', dpi=300)
+        loss_file = out_path(param_dict, 'loss_curves.jpg')
+        plt.savefig(loss_file, bbox_inches='tight', dpi=300)
         plt.clf()
 
-        print('Training loss curves: loss_curves.jpg')
+        print(f'Training loss curves: {loss_file}')
 
     checkpoint = torch.load(os.path.join(path_save, net_file), map_location=device)
     net = checkpoint['net']
@@ -551,7 +556,7 @@ def inference_func1(param_dict, test_idx, fig_flag=True):  # simulation and try 
         else:
             plt.title(f'Found {xyz_rec.shape[0]} emitters out of {xyz_gt.shape[0]}')
         plt.legend()
-        plt.savefig('sim_loc_gt_rec.jpg', dpi=300)
+        plt.savefig(out_path(param_dict, 'sim_loc_gt_rec.jpg'), dpi=300)
         plt.clf()
 
         nphotons_rec = 1e4 * np.ones(xyz_rec.shape[0])
@@ -582,10 +587,11 @@ def inference_func1(param_dict, test_idx, fig_flag=True):  # simulation and try 
         plt.title('overlay')
         plt.axis('off')
 
-        plt.savefig('sim_im_gt_rec.jpg', bbox_inches='tight', dpi=300)
+        sim_file = out_path(param_dict, 'sim_im_gt_rec.jpg')
+        plt.savefig(sim_file, bbox_inches='tight', dpi=300)
         plt.clf()
 
-        print('Network inference on simulated an image: sim_im_gt_rec.jpg')
+        print(f'Network inference on simulated an image: {sim_file}')
 
     exp_imgs_path = param_dict['im_br_folder']
     img_names = sorted(os.listdir(exp_imgs_path))
@@ -648,9 +654,10 @@ def inference_func1(param_dict, test_idx, fig_flag=True):  # simulation and try 
     plt.axis('off')
 
 
-    plt.savefig('exp_im_gt_rec.jpg', bbox_inches='tight', dpi=300)
+    exp_file = out_path(param_dict, 'exp_im_gt_rec.jpg')
+    plt.savefig(exp_file, bbox_inches='tight', dpi=300)
 
-    print('Network inference on a test experimental image: exp_im_gt_rec.jpg')
+    print(f'Network inference on a test experimental image: {exp_file}')
 
 
 def inference_func2(param_dict):
@@ -714,11 +721,11 @@ def inference_func2(param_dict):
         tall_end // 3600, np.floor((tall_end / 3600 - tall_end // 3600) * 60), tall_end % 60))
     print('=' * 50)
 
-    # write the results to a csv file named "localizations.csv" under the exp img folder
+    # write the results to a csv file named "localizations.csv" under the output folder
     row_list = results.tolist()
 
     time_now = datetime.today().strftime('%m-%d_%H-%M')
-    file_name = os.path.join(os.getcwd(), 'localizations_' + time_now + '.csv')
+    file_name = out_path(param_dict, 'localizations_' + time_now + '.csv')
     with open(file_name, 'w', newline='') as file:
         writer = csv.writer(file)
         writer.writerows(row_list)

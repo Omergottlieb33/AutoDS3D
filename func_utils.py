@@ -11,15 +11,53 @@ import pickle
 from skimage import io
 
 
+APP_FOLDER = os.path.dirname(os.path.abspath(__file__))
+
+
+def resolve_path(path):
+    """Resolve a user-supplied path.
+
+    An absolute path is used as is, so files anywhere on the filesystem are
+    accepted; a relative path is resolved against the app folder. Windows-style
+    separators, '~' and surrounding quotes are accepted on any platform.
+    """
+    path = path.strip().strip('"').strip("'")
+    path = os.path.expanduser(path.replace('\\', os.sep))
+    if os.path.isabs(path):
+        return os.path.normpath(path)
+    return os.path.normpath(os.path.join(APP_FOLDER, path))
+
+
+def prepare_output_dir(output_dir):
+    """Resolve the user-supplied output folder and create it if needed.
+
+    Every product of the pipeline (figures, training data, trained nets and the
+    localization list) is written under the returned folder.
+    """
+    output_dir = resolve_path(output_dir) if output_dir.strip() else os.path.join(APP_FOLDER, 'results')
+    os.makedirs(output_dir, exist_ok=True)
+    return output_dir
+
+
+def br_folder_path(output_dir, raw_image_folder):
+    """Where the background-removed images live: inside the output folder, under
+    a name derived from the raw image folder, so the raw data folder is untouched.
+    """
+    raw_name = os.path.basename(resolve_path(raw_image_folder))
+    return os.path.join(output_dir, raw_name + '_br')
+
+
 def func1(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, external_mask,
           zstack_file, nfp_text, NFP, zrange, raw_image_folder, snr_roi, max_pv, projection_01,
           num_z_voxel, training_im_size, us_factor, max_num_particles, num_training_images, previous_param_dict, test_idx, threshold,
+          output_dir,
           state):
     # fetch param_dict
     if 'param_dict' not in state.keys():  # in the case of preprocessing images before characterizing PSF
         state['param_dict'] = dict()
     param_dict = state['param_dict']
     # update param_dict
+    param_dict['output_dir'] = prepare_output_dir(output_dir)
     param_dict['M'] = M
     param_dict['NA'] = NA
     param_dict['lamda'] = lamda
@@ -35,9 +73,11 @@ def func1(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, externa
     # a dict for phase retrieval
     nfp_text = nfp_text.split(',')
     nfps = np.linspace(float(nfp_text[0]), float(nfp_text[1]), int(nfp_text[2]))
+    zstack_file_path = resolve_path(zstack_file)
+    if not os.path.isfile(zstack_file_path):
+        return f'z-stack file not found:\n{zstack_file_path}'
     pr_dict = dict(
-        # zstack_file_path=os.path.join(os.getcwd(), zstack_file),
-        zstack_file_path=zstack_file,
+        zstack_file_path=zstack_file_path,
         nfps=nfps,
         r_bead=0.02,  # a default value, not critical
         epoch_num=250,  # optimization iterations
@@ -49,13 +89,20 @@ def func1(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, externa
         print(f'PSF modeling accuracy: average cc of {np.round(np.mean(ccs), decimals=4)}.')
 
     else:
-        mask_dict = sio.loadmat(external_mask)
+        mask_dict = sio.loadmat(resolve_path(external_mask))
         mask_name = list(mask_dict.keys())[3]
         phase_mask = mask_dict[mask_name]
         g_sigma = 0.6
 
     param_dict['g_sigma'] = (np.round(0.8*g_sigma, decimals=2), np.round(1.2*g_sigma, decimals=2))
     param_dict['phase_mask'] = phase_mask
+
+    # save the mask itself, so it can be reused without running phase retrieval again
+    mask_npy = os.path.join(param_dict['output_dir'], 'phase_mask.npy')
+    mask_mat = os.path.join(param_dict['output_dir'], 'phase_mask.mat')
+    np.save(mask_npy, phase_mask)
+    sio.savemat(mask_mat, {'phase_mask': phase_mask})  # readable back through the [external mask] field
+    print(f'Phase mask is saved as {mask_npy} and {mask_mat}')
 
     # show z-PSF regarding the NFP
     param_dict['NFP'] = NFP  # now it's not bead
@@ -73,22 +120,26 @@ def func1(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, externa
     else:
         state['param_dict'] = param_dict
 
-    return ("PSF characterization is done. Check "
-            "\nphase_retrieval_results.jpg "
-            "\nPSFs.jpg")
+    return (f'PSF characterization is done. Check in {param_dict["output_dir"]}'
+            '\nphase_retrieval_results.jpg '
+            '\nPSFs.jpg'
+            '\nphase_mask.npy, phase_mask.mat')
 
 
 # background removal
 def func2(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, external_mask,
           zstack_file, nfp_text, NFP, zrange, raw_image_folder, snr_roi, max_pv, projection_01,
           num_z_voxel, training_im_size, us_factor, max_num_particles, num_training_images, previous_param_dict, test_idx, threshold,
+          output_dir,
           state):  # preprocessing
     # fetch param_dict
     if 'param_dict' not in state.keys():  # in the case of preprocessing images before characterizing PSF
         state['param_dict'] = dict()
     param_dict = state['param_dict']
+    param_dict['output_dir'] = prepare_output_dir(output_dir)
 
-    im_br_folder = background_removal(raw_image_folder)
+    im_br_folder = background_removal(resolve_path(raw_image_folder),
+                                      br_folder_path(param_dict['output_dir'], raw_image_folder))
 
     # update param_dict
     param_dict['im_br_folder'] = im_br_folder
@@ -103,6 +154,7 @@ def func2(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, externa
 def func3(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, external_mask,
           zstack_file, nfp_text, NFP, zrange, raw_image_folder, snr_roi, max_pv, projection_01,
           num_z_voxel, training_im_size, us_factor, max_num_particles, num_training_images, previous_param_dict, test_idx, threshold,
+          output_dir,
           state):
     # fetch param_dict
     if 'param_dict' not in state.keys():  # in the case of preprocessing images before characterizing PSF
@@ -113,6 +165,7 @@ def func3(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, externa
         if 'phase_mask' not in param_dict.keys():
             print('Cannot proceed. Please characterize PSF] first.')
         else:
+            param_dict['output_dir'] = prepare_output_dir(output_dir)
             snr_roi = snr_roi.split(',')
             snr_roi = (int(snr_roi[0]), int(snr_roi[1]), int(snr_roi[2]), int(snr_roi[3]))
 
@@ -145,6 +198,7 @@ def func3(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, externa
 def func4(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, external_mask,
           zstack_file, nfp_text, NFP, zrange, raw_image_folder, snr_roi, max_pv, projection_01,
           num_z_voxel, training_im_size, us_factor, max_num_particles, num_training_images, previous_param_dict, test_idx, threshold,
+          output_dir,
           state):  # training data
 
     if 'param_dict' not in state.keys():  # in the case of preprocessing images before characterizing PSF
@@ -156,6 +210,7 @@ def func4(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, externa
             print('Cannot proceed. Please characterize PSF first.')
         else:
             # update param_dict
+            param_dict['output_dir'] = prepare_output_dir(output_dir)
             param_dict['H'] = int(training_im_size)
             param_dict['W'] = int(training_im_size)
             param_dict['D'] = int(num_z_voxel)
@@ -181,7 +236,7 @@ def func4(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, externa
             param_dict['vs_xy'] = vs_xy
             param_dict['vs_z'] = vs_z
 
-            param_dict['td_folder'] = os.path.join(os.getcwd(), 'training_data', "gui")  # where to save the training data
+            param_dict['td_folder'] = os.path.join(param_dict['output_dir'], 'training_data', "gui")  # where to save the training data
             if projection_01 == 0:
                 param_dict['project_01'] = False  # seems better to not have 01 normalization
             else:
@@ -202,19 +257,21 @@ def func4(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, externa
             im_sim_exp[:im_sim.shape[0], :im_sim.shape[1]] = im_sim
             im_sim_exp[:im_exp.shape[0], cc:cc+im_exp.shape[1]] = im_exp
             im_sim_exp = im_sim_exp.astype(np.uint16)
-            io.imsave('sim_exp.tif', im_sim_exp, check_contrast=False)
-            print(f'visual comparison between sim and exp: sim_exp.tif')
+            sim_exp_file = os.path.join(param_dict['output_dir'], 'sim_exp.tif')
+            io.imsave(sim_exp_file, im_sim_exp, check_contrast=False)
+            print(f'visual comparison between sim and exp: {sim_exp_file}')
 
             param_dict['im_sim_exp'] = im_sim_exp
 
             return (f'Training data generation is done. '
                     f'\ndata folder: {param_dict["td_folder"]}.'
-                    f'\ncheck sim_exp.tif to tune MPV if necessary.')
+                    f'\ncheck {sim_exp_file} to tune MPV if necessary.')
 
 # training
 def func5(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, external_mask,
           zstack_file, nfp_text, NFP, zrange, raw_image_folder, snr_roi, max_pv, projection_01,
           num_z_voxel, training_im_size, us_factor, max_num_particles, num_training_images, previous_param_dict, test_idx, threshold,
+          output_dir,
           state):
     if 'param_dict' not in state.keys():  # in the case of preprocessing images before characterizing PSF
         print('Cannot proceed.')
@@ -225,7 +282,8 @@ def func5(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, externa
             print('Cannot proceed. Please characterize PSF first.')
         else:
             # update param_dict
-            param_dict['path_save'] = os.path.join(os.getcwd(), 'training_results')
+            param_dict['output_dir'] = prepare_output_dir(output_dir)
+            param_dict['path_save'] = os.path.join(param_dict['output_dir'], 'training_results')
 
             training_dict = dict(
                 batch_size=16,
@@ -240,7 +298,7 @@ def func5(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, externa
             # param_dict['fit_file'] = 'fit_01-23_17-02.pickle'
 
             # save param_dict
-            param_file_name = 'param_dict_' + net_file[4:-3] + '.pickle'
+            param_file_name = os.path.join(param_dict['output_dir'], 'param_dict_' + net_file[4:-3] + '.pickle')
             with open(param_file_name, 'wb') as handle:
                 pickle.dump(param_dict, handle)
             print(f'A training file is saved as {param_file_name}')
@@ -254,6 +312,7 @@ def func5(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, externa
 def func6_1(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, external_mask,
           zstack_file, nfp_text, NFP, zrange, raw_image_folder, snr_roi, max_pv, projection_01,
           num_z_voxel, training_im_size, us_factor, max_num_particles, num_training_images, previous_param_dict, test_idx, threshold,
+          output_dir,
           state):
 
     if previous_param_dict != 'None':  # overwrite the param_dict
@@ -269,7 +328,8 @@ def func6_1(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, exter
         if 'phase_mask' not in param_dict.keys():
             print('Cannot proceed. Please characterize PSF first.')
         else:
-            image_br_folder = raw_image_folder + '_br'
+            param_dict['output_dir'] = prepare_output_dir(output_dir)
+            image_br_folder = br_folder_path(param_dict['output_dir'], raw_image_folder)
             if not os.path.isdir(image_br_folder):
                 print(f'Cannot proceed. Please preprocess images (background removal).')
             else:
@@ -277,7 +337,7 @@ def func6_1(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, exter
                 param_dict_copy = param_dict.copy()  # don't change the state['param_dict']
                 param_dict_copy['threshold'] = threshold
                 inference_func1(param_dict_copy, test_idx)
-                return ('Test is done. check'
+                return (f'Test is done. check in {param_dict["output_dir"]}'
                         '\nloss_curves.jpg'
                         '\nsim_loc_gt_rec.jpg'
                         '\nsim_im_gt_rec.jpg'
@@ -287,6 +347,7 @@ def func6_1(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, exter
 def func6_2(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, external_mask,
           zstack_file, nfp_text, NFP, zrange, raw_image_folder, snr_roi, max_pv, projection_01,
           num_z_voxel, training_im_size, us_factor, max_num_particles, num_training_images, previous_param_dict, test_idx, threshold,
+          output_dir,
           state):
 
     if previous_param_dict != 'None':  # overwrite the param_dict
@@ -302,7 +363,8 @@ def func6_2(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, exter
         if 'phase_mask' not in param_dict.keys():
             print('Cannot proceed. Please characterize PSF first.')
         else:
-            image_br_folder = raw_image_folder + '_br'
+            param_dict['output_dir'] = prepare_output_dir(output_dir)
+            image_br_folder = br_folder_path(param_dict['output_dir'], raw_image_folder)
             if not os.path.isdir(image_br_folder):
                 print(f'Cannot proceed. Please preprocess images (background removal).')
             else:
@@ -317,35 +379,43 @@ def func6_2(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, exter
 def func7(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, external_mask,
           zstack_file, nfp_text, NFP, zrange, raw_image_folder, snr_roi, max_pv, projection_01,
           num_z_voxel, training_im_size, us_factor, max_num_particles, num_training_images, previous_param_dict, test_idx, threshold,
+          output_dir,
           state):
 
     func1(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, external_mask,
           zstack_file, nfp_text, NFP, zrange, raw_image_folder, snr_roi, max_pv, projection_01,
           num_z_voxel, training_im_size, us_factor, max_num_particles, num_training_images, previous_param_dict, test_idx, threshold,
+          output_dir,
           state)
     func2(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, external_mask,
           zstack_file, nfp_text, NFP, zrange, raw_image_folder, snr_roi, max_pv, projection_01,
           num_z_voxel, training_im_size, us_factor, max_num_particles, num_training_images, previous_param_dict, test_idx, threshold,
+          output_dir,
           state)
     func3(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, external_mask,
           zstack_file, nfp_text, NFP, zrange, raw_image_folder, snr_roi, max_pv, projection_01,
           num_z_voxel, training_im_size, us_factor, max_num_particles, num_training_images, previous_param_dict, test_idx, threshold,
+          output_dir,
           state)
     func4(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, external_mask,
           zstack_file, nfp_text, NFP, zrange, raw_image_folder, snr_roi, max_pv, projection_01,
           num_z_voxel, training_im_size, us_factor, max_num_particles, num_training_images, previous_param_dict, test_idx, threshold,
+          output_dir,
           state)
     func5(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, external_mask,
           zstack_file, nfp_text, NFP, zrange, raw_image_folder, snr_roi, max_pv, projection_01,
           num_z_voxel, training_im_size, us_factor, max_num_particles, num_training_images, previous_param_dict, test_idx, threshold,
+          output_dir,
           state)
     func6_1(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, external_mask,
           zstack_file, nfp_text, NFP, zrange, raw_image_folder, snr_roi, max_pv, projection_01,
           num_z_voxel, training_im_size, us_factor, max_num_particles, num_training_images, previous_param_dict, test_idx, threshold,
+          output_dir,
           state)
     func6_2(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, external_mask,
           zstack_file, nfp_text, NFP, zrange, raw_image_folder, snr_roi, max_pv, projection_01,
           num_z_voxel, training_im_size, us_factor, max_num_particles, num_training_images, previous_param_dict, test_idx, threshold,
+          output_dir,
           state)
 
     return 'One click is done.'

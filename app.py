@@ -52,15 +52,15 @@ with gr.Blocks() as demo:
             n_sample = gr.Number(label="★refractive index of sample", value=1.33)
             ps_camera = gr.Number(label="★camera pixel size at image plane [um]", value=13.8)
 
-            f_4f = gr.Number(label="focal length of the 4f setup [um]", value=100e3, visible=False)
-            ps_BFP = gr.Number(label="■ pixel size of mask plane [um]", value=30, visible=False)
-            external_mask = gr.Textbox(label="external mask", value='None', visible=False)
+            f_4f = gr.Number(label="focal length of the 4f setup [um]", value=100e3, visible=True)
+            ps_BFP = gr.Number(label="■ pixel size of mask plane [um]", value=30, visible=True)
+            external_mask = gr.Textbox(label="external mask", value='None', visible=True)
 
 
 
         # calibration z-stack parameters
         with gr.Accordion('parameter column 2', open=False):
-            zstack_file = gr.Textbox(label='★z-stack file (within app folder)', value=r'.\dataset3\calibration 1.tif')
+            zstack_file = gr.Textbox(label='★z-stack file (full path, or relative to app folder)', value=r'.\dataset3\calibration 1.tif')
             nfp_text = gr.Textbox(label="★z-stack NFPs (start, end, number) [um]", value='-0.5, 0.5, 41')
             # zstack_file = gr.Textbox(label='★z-stack file (within app folder)', value=r'zstack2_-32_18.tif')
             # nfp_text = gr.Textbox(label="★z-stack NFPs (start, end, number) [um]", value='-3.2, 1.8, 51')
@@ -98,9 +98,13 @@ with gr.Blocks() as demo:
             test_idx = gr.Number(label='■ test image index', value=10)
             threshold = gr.Number(label='■ threshold (0-1000)', value=40)
 
+    output_dir = gr.Textbox(label='★output folder (full path, or relative to app folder) - all results are saved here',
+                            value=r'.\results')
+
     input_all = [M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, external_mask,
                  zstack_file, nfp_text, NFP, zrange, raw_image_folder, snr_roi, max_pv, projection_01,
                  num_z_voxel, training_im_size, us_factor, max_num_particles, num_training_images, previous_param_dict, test_idx, threshold,
+                 output_dir,
                  state]
 
     with gr.Row():

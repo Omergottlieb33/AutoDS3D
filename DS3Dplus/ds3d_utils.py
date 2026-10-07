@@ -61,6 +61,7 @@ class ImModel(nn.Module):
 
         ################### set parameters: unit:um
         device = params['device']
+        self.output_dir = params.get('output_dir', os.getcwd())  # where figures are saved
         # oil objective
         M = params['M']  # magnification
         NA = params['NA']  # NA
@@ -238,9 +239,10 @@ class ImModel(nn.Module):
         plt.imshow(torch.cat([zstack[i] for i in range(zstack.shape[0])], dim=1))
         plt.title(f'z positions [um]: {np.round(zs, 2)}')
         plt.axis('off')
-        plt.savefig('PSFs.jpg', bbox_inches='tight', dpi=300)
+        psf_file = os.path.join(self.output_dir, 'PSFs.jpg')
+        plt.savefig(psf_file, bbox_inches='tight', dpi=300)
         plt.clf()
-        print('Imaging model: PSFs.jpg')
+        print(f'Imaging model: {psf_file}')
 
 
 class ImModelBase(nn.Module):
@@ -506,6 +508,7 @@ class Sampling():
         self.buffer_WW = params['buffer_WW']  # buffer in x, place Gaussian blobs and avoid PSF cropping
         self.vs_xy, self.vs_z = params['vs_xy'], params['vs_z']
         self.zrange = params['zrange']
+        self.output_dir = params.get('output_dir', os.getcwd())  # where figures are saved
 
         self.Nsig_range = params['Nsig_range']  # photon count range
         self.num_particles_range = params['num_particles_range']  # emitter count range
@@ -578,9 +581,10 @@ class Sampling():
         plt.title('xz max projection')
 
         # plt.show()
-        plt.savefig('volume_projection.jpg', bbox_inches='tight', dpi=300)
+        vol_file = os.path.join(self.output_dir, 'volume_projection.jpg')
+        plt.savefig(vol_file, bbox_inches='tight', dpi=300)
         plt.clf()
-        print('Volume (network output) example: volume_projection.jpg')
+        print(f'Volume (network output) example: {vol_file}')
 
 class Volume2XYZ(nn.Module):
     def __init__(self, params):
@@ -691,13 +695,16 @@ class MyDataset(Dataset):
 
         x = x[np.newaxis, :, :].astype(np.float32)
 
-        y = np.zeros(self.volume_size)
-        y = np.pad(y, self.r)
+        # Allocate the padded volume directly, in float32: np.zeros + np.pad used to
+        # build a float64 volume (72 MB here) and copy it, and only the small blob
+        # neighbourhoods are ever written. Freshly faulting that much memory per
+        # sample costs ~130 ms on a fragmented host, which starves the GPU.
+        y = np.zeros([s + 2 * self.r for s in self.volume_size], dtype=np.float32)
         xyz_ids, blob3d = self.labels[ID]['xyz_ids'], self.labels[ID]['blob3d']
         for i in range(xyz_ids.shape[0]):
             xidx, yidx, zidx = xyz_ids[i, 0], xyz_ids[i, 1], xyz_ids[i, 2]
             y[zidx:zidx + 2 * self.r + 1, yidx:yidx + 2 * self.r + 1, xidx:xidx + 2 * self.r + 1] += blob3d[i]
-        y = (y[self.r:-self.r, self.r:-self.r, self.r:-self.r]).astype(np.float32)
+        y = y[self.r:-self.r, self.r:-self.r, self.r:-self.r]
 
         return x, y
 

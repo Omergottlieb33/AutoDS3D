@@ -1,5 +1,6 @@
 import os
 import abc
+import copy
 import sys
 import tqdm
 import torch
@@ -38,6 +39,28 @@ class FitResult(NamedTuple):
     train_acc: List[float]
     test_loss: List[float]
     test_acc: List[float]
+    lr: List[float] = None  # learning rate used in each epoch
+    val_metric: List[float] = None  # val_metric_fn result per epoch (e.g. validation Jaccard)
+
+
+class ModelEMA:
+    """Exponential moving average of the model weights; buffers (BatchNorm statistics) are copied."""
+    def __init__(self, model, decay):
+        self.module = copy.deepcopy(model).eval()
+        for p in self.module.parameters():
+            p.requires_grad_(False)
+        self.decay = decay
+        self.num_updates = 0
+
+    @torch.no_grad()
+    def update(self, model):
+        self.num_updates += 1
+        # warm up the average so the first steps are not dominated by the random initialization
+        decay = min(self.decay, (1 + self.num_updates) / (10 + self.num_updates))
+        for p_ema, p in zip(self.module.parameters(), model.parameters()):
+            p_ema.lerp_(p.detach(), 1 - decay)
+        for b_ema, b in zip(self.module.buffers(), model.buffers()):
+            b_ema.copy_(b)
 
 
 
@@ -49,7 +72,7 @@ class Trainer(abc.ABC):
     - Single epoch (train_epoch/test_epoch)
     - Single batch (train_batch/test_batch)
     """
-    def __init__(self, model, loss_fn, optimizer, lr_scheduler=None, device=None):
+    def __init__(self, model, loss_fn, optimizer, lr_scheduler=None, device=None, grad_clip=None, ema_decay=None):
         """
         Initialize the trainer.
         :param model: Instance of the model to train.
@@ -57,14 +80,24 @@ class Trainer(abc.ABC):
         :param optimizer: The optimizer to train with.
         :param lr_scheduler: learning rate adjustment if given lr_scheduler
         :param device: torch.device to run training on (CPU or GPU).
+        :param grad_clip: max gradient norm; None/0 disables clipping.
+        :param ema_decay: keep an exponential moving average of the weights; it is used for
+            validation and saved in checkpoints. None/0 disables it.
         """
         self.model = model
         self.loss_fn = loss_fn
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.device = device
+        self.grad_clip = grad_clip
         if self.device:
             model.to(self.device)  # put the model into the designated device
+        self.ema = ModelEMA(model, ema_decay) if ema_decay else None
+
+    @property
+    def eval_model(self):
+        """The weights that are validated and checkpointed: the EMA if enabled, else the trained model."""
+        return self.ema.module if self.ema is not None else self.model
 
     # ********* change this part accordingly
     def fit(self,
@@ -75,6 +108,8 @@ class Trainer(abc.ABC):
             early_stopping: int = None,  # stop training if there is no improvement for this number of epochs
             print_every=1,  # print period (epoch), the first and last epoch are mandatory
             post_epoch_fn: Callable = None,  # what to do after each epoch
+            val_metric_fn: Callable = None,  # val_metric_fn(eval_model) -> float, computed each epoch
+            select_by_val_metric: bool = False,  # checkpoint/early-stop on val_metric_fn (higher is better)
             **kw,  # other parameters
     ) -> FitResult:
         """
@@ -94,6 +129,7 @@ class Trainer(abc.ABC):
         """
         actual_num_epochs = 0  # indicator of current epoch
         train_loss, train_acc, test_loss, test_acc = [], [], [], []  # lists for epoch results
+        lrs, val_metric = [], []
 
         best_metric = None  # a metric for raising: model save, early stopping and learning rate adjustment
         epochs_without_improvement = 0  # the number of epochs that best_loss is not updated
@@ -105,6 +141,7 @@ class Trainer(abc.ABC):
             self._print(f"--- EPOCH {epoch + 1}/{num_epochs} ---", verbose)
 
             # training for one epoch
+            lrs.append(self.optimizer.param_groups[0]['lr'])
             epoch_train_result = self.train_epoch(dl_train, verbose=verbose, **kw)  # get a EpochResult
             train_loss.append(sum(epoch_train_result.losses)/len(epoch_train_result.losses))
             train_acc.append(epoch_train_result.accuracy)
@@ -114,8 +151,13 @@ class Trainer(abc.ABC):
 
             # what to do after one epoch of training and test
             actual_num_epochs += 1
+            if val_metric_fn is not None:
+                val_metric.append(val_metric_fn(self.eval_model))
+                self._print(f"lr {lrs[-1]:.2e} | val loss {test_loss[-1]:.4f} | val metric {val_metric[-1]:.4f}",
+                            verbose)
             # current_average_metric = epoch_test_result.accuracy  # the last average loss. test_loss is the list of epoch losses
-            current_average_metric = test_loss[-1]
+            # lower is better for both: negate the metric (e.g. Jaccard) when selecting by it
+            current_average_metric = -val_metric[-1] if select_by_val_metric else test_loss[-1]
             # early stopping? save the model?
             if best_metric is not None and current_average_metric > best_metric:  # if accuracy is getting worse
                 epochs_without_improvement += 1
@@ -124,16 +166,19 @@ class Trainer(abc.ABC):
                 epochs_without_improvement = 0
 
                 if checkpoints is not None:  # if checkpoints is given, save the net
-                    checkpoints['state_dict'] = self.model.state_dict()
+                    checkpoints['state_dict'] = self.eval_model.state_dict()
                     torch.save(checkpoints, checkpoints['file_name'])
                     print(f"\n*** Saved checkpoint {checkpoints['file_name']}")
 
             if early_stopping and epochs_without_improvement == early_stopping:
                 break
 
-            # update learning rate?
-            if self.lr_scheduler is not None:
-                self.lr_scheduler.step(current_average_metric)
+            # update learning rate? Only ReduceLROnPlateau takes the metric; for other schedulers a
+            # positional argument would be read as an epoch number and set the wrong learning rate.
+            if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                self.lr_scheduler.step(test_loss[-1])
+            elif self.lr_scheduler is not None:
+                self.lr_scheduler.step()
 
             # in case sth should be done after each epoch
             if post_epoch_fn:
@@ -148,7 +193,8 @@ class Trainer(abc.ABC):
 
             # ========================
 
-        return FitResult(actual_num_epochs, train_loss, train_acc, test_loss, test_acc)  # return a FitResult
+        return FitResult(actual_num_epochs, train_loss, train_acc, test_loss, test_acc, lrs,
+                         val_metric if val_metric_fn is not None else None)
 
     def save_checkpoint(self, checkpoints: dict):
         """
@@ -189,6 +235,7 @@ class Trainer(abc.ABC):
         :return: An EpochResult for the epoch.
         """
         self.model.train(False)  # set evaluation (test) mode
+        self.eval_model.train(False)
         return self._foreach_batch(dl_test, self.test_batch, kw['verbose'])
 
     @abc.abstractmethod
@@ -279,8 +326,8 @@ class Trainer(abc.ABC):
 
 
 class TorchTrainer(Trainer):
-    def __init__(self, model, loss_fn, optimizer, lr_scheduler=None, device=None):
-        super().__init__(model, loss_fn, optimizer, lr_scheduler, device)
+    def __init__(self, model, loss_fn, optimizer, lr_scheduler=None, device=None, grad_clip=None, ema_decay=None):
+        super().__init__(model, loss_fn, optimizer, lr_scheduler, device, grad_clip, ema_decay)
 
     def train_batch(self, batch) -> BatchResult:
         X, y = batch  # unpacking
@@ -292,7 +339,11 @@ class TorchTrainer(Trainer):
         output = self.model(X)
         loss = self.loss_fn(output, y)
         loss.backward()
+        if self.grad_clip:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
         self.optimizer.step()
+        if self.ema is not None:
+            self.ema.update(self.model)
 
         jacc_ind = 0
 
@@ -305,7 +356,7 @@ class TorchTrainer(Trainer):
             y = y.to(self.device)
 
         with torch.no_grad():
-            output = self.model(X)
+            output = self.eval_model(X)
             loss = self.loss_fn(output, y)
 
             jacc_ind = 0
