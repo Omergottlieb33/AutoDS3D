@@ -52,6 +52,30 @@ class NonUniformBg(nn.Module):
         return h
 
 
+class StructuredBg(nn.Module):
+    # random background map in [0, 1]: a broad tilted gaussian (NonUniformBg) mixed with smooth
+    # patchy blobs, mimicking autofluorescence / out-of-focus light in experimental frames
+    def __init__(self, HW=(121, 121), sigma_range=(4, 20)):
+        super().__init__()
+        self.H, self.W = HW
+        self.sigma_range = sigma_range
+        self.broad = NonUniformBg(HW=HW, xy_offset=(self.W / 5, self.H / 5), angle_range=(-pi / 4, pi / 4))
+
+    def forward(self, ):
+        sigma = self.sigma_range[0] + torch.rand(1).item() * (self.sigma_range[1] - self.sigma_range[0])
+        r = int(3 * sigma)
+        xs = torch.arange(-r, r + 1, dtype=torch.float32)
+        g = torch.exp(-0.5 * xs ** 2 / sigma ** 2)
+        g = g / g.sum()
+        noise = torch.randn(1, 1, self.H + 2 * r, self.W + 2 * r)
+        patchy = F.conv2d(F.conv2d(noise, g.view(1, 1, 1, -1)), g.view(1, 1, -1, 1)).squeeze()
+        patchy = (patchy - patchy.min()) / (patchy.max() - patchy.min())
+
+        w = torch.rand(1)  # mixing weight between broad and patchy components
+        h = w * self.broad() + (1 - w) * patchy
+        return (h - h.min()) / (h.max() - h.min())
+
+
 class ImModel(nn.Module):
     def __init__(self, params):
         """
@@ -428,7 +452,11 @@ class ImModelTraining(ImModelBase):
         H, W = param_dict['H'], param_dict['W']
         self.non_uniform_noise = NonUniformBg(HW=(H, W), xy_offset=(W/5, H/5), angle_range=(-pi / 4, pi / 4))
         self.bitdepth = param_dict['bitdepth']
-        
+        # optional structured background (photons), amplitude drawn per image from bg_range
+        self.bg_range = param_dict.get('bg_range', None)
+        if self.bg_range is not None:
+            self.structured_bg = StructuredBg(HW=(H, W))
+
 
     def blur_kernels(self, Nemitters):
         std_min, std_max = self.g_sigma
@@ -466,6 +494,9 @@ class ImModelTraining(ImModelBase):
 
         # noise: background, shot, readout
         # im = torch.poisson(im + self.bg)  # rounded
+        if self.bg_range is not None:
+            bg_amp = self.bg_range[0] + torch.rand(1).item() * (self.bg_range[1] - self.bg_range[0])
+            im = im + bg_amp * self.structured_bg().to(self.device, im.dtype)
         im = torch.poisson(im)  # rounded
 
         read_baseline = self.baseline[0] + torch.rand(1, device=self.device) * (self.baseline[1] - self.baseline[0])
@@ -700,7 +731,12 @@ class MyDataset(Dataset):
         # neighbourhoods are ever written. Freshly faulting that much memory per
         # sample costs ~130 ms on a fragmented host, which starves the GPU.
         y = np.zeros([s + 2 * self.r for s in self.volume_size], dtype=np.float32)
-        xyz_ids, blob3d = self.labels[ID]['xyz_ids'], self.labels[ID]['blob3d']
+        # labels may be stored as a dict {'xyz_ids', 'blob3d'} or as a tuple (xyz_ids, blob3d)
+        label = self.labels[ID]
+        if isinstance(label, dict):
+            xyz_ids, blob3d = label['xyz_ids'], label['blob3d']
+        else:
+            xyz_ids, blob3d = label[0], label[1]
         for i in range(xyz_ids.shape[0]):
             xidx, yidx, zidx = xyz_ids[i, 0], xyz_ids[i, 1], xyz_ids[i, 2]
             y[zidx:zidx + 2 * self.r + 1, yidx:yidx + 2 * self.r + 1, xidx:xidx + 2 * self.r + 1] += blob3d[i]

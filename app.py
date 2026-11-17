@@ -83,7 +83,7 @@ with gr.Blocks() as demo:
             # photon_roi = gr.Textbox(label='★a sparse ROI (r0, c0, r1, c1)', value='80, 80, 100, 100')
 
             max_pv = gr.Number(label='■ maximum pixel value (MPV)', value=250)
-            projection_01 = gr.Number(label='0-1 projection', visible=False)
+            projection_01 = gr.Number(label='0-1 projection', visible=True)
 
         # blinking images
         with gr.Accordion('parameter column 3', open=False):
