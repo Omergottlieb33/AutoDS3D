@@ -1,7 +1,7 @@
 
 from app_utils import (phase_retrieval, background_removal, mu_std_p, training_data_func, training_func,
                        inference_func1, inference_func2)
-from app_utils import show_z_psf
+from app_utils import show_z_psf, read_frame
 import numpy as np
 import torch
 import os
@@ -250,7 +250,7 @@ def func4(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, externa
             x_folder = os.path.join(param_dict['td_folder'], 'x')
             im_sim = io.imread(os.path.join(x_folder, os.listdir(x_folder)[0]))
 
-            im_exp = io.imread(os.path.join(param_dict['im_br_folder'], os.listdir(param_dict['im_br_folder'])[0]))
+            im_exp = read_frame(param_dict['im_br_folder'], 0)
             rr = max([im_sim.shape[0], im_exp.shape[0]])
             cc = max([im_sim.shape[1], im_exp.shape[1]])
             im_sim_exp = np.zeros((rr, 2*cc))

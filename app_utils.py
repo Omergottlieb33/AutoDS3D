@@ -2,6 +2,7 @@
 import numpy as np
 from numpy import pi
 from skimage import io
+import tifffile
 import csv
 import time
 import os
@@ -24,6 +25,7 @@ from DS3Dplus.ds3d_utils import ImModel, Sampling, MyDataset, Volume2XYZ, calc_j
 from DS3Dplus.ds3d_utils import LON as Net
 from DS3Dplus.training_utils import TorchTrainer
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 
 def out_path(param_dict, file_name):
@@ -294,41 +296,99 @@ def show_z_psf(param_dict):
     model.model_demo(np.linspace(param_dict['zrange'][0], param_dict['zrange'][1], 5))  # check PSFs
 
 
+IMAGE_EXTS = {'.tif', '.tiff', '.png', '.jpg', '.jpeg', '.bmp'}
+
+
+def list_image_files(folder):
+    return sorted(n for n in os.listdir(folder)
+                  if os.path.isfile(os.path.join(folder, n)) and os.path.splitext(n)[1].lower() in IMAGE_EXTS)
+
+
+def read_stack(path):
+    """Read an image file as a stack (n_frames, H, W). A single image gives n_frames=1."""
+    stack = tifffile.imread(path) if path.lower().endswith(('.tif', '.tiff')) else io.imread(path)
+    return stack[np.newaxis] if stack.ndim == 2 else stack
+
+
+def frame_counts(folder):
+    """[(file name, number of frames)] for a folder of single- or multi-frame images (sorted by name)."""
+    counts = []
+    for name in list_image_files(folder):
+        path = os.path.join(folder, name)
+        if name.lower().endswith(('.tif', '.tiff')):
+            with tifffile.TiffFile(path) as tf:
+                shape = tf.series[0].shape
+            counts.append((name, shape[0] if len(shape) == 3 else 1))
+        else:
+            counts.append((name, 1))
+    return counts
+
+
+def iter_frames(folder):
+    """Yield (global 0-based frame index, 2D frame) over all files of the folder, reading one file at a time."""
+    idx = 0
+    for name, _ in frame_counts(folder):
+        for frame in read_stack(os.path.join(folder, name)):
+            yield idx, frame
+            idx += 1
+
+
+def read_frame(folder, frame_idx):
+    """Read one frame by its global 0-based index without loading the other files."""
+    start = 0
+    for name, n in frame_counts(folder):
+        if frame_idx < start + n:
+            return read_stack(os.path.join(folder, name))[frame_idx - start]
+        start += n
+    raise IndexError(f'frame {frame_idx} is out of range ({start} frames in {folder})')
+
+
+def read_last_frames(folder, num):
+    """The last `num` frames (or all, if fewer) as an array (n, H, W).
+
+    If the folder holds multi-frame tifs, only the last file is used (its last `num` frames);
+    for single-frame images the last `num` files are used.
+    """
+    counts = frame_counts(folder)
+    if any(n > 1 for _, n in counts):
+        counts = counts[-1:]
+    frames, need = [], num
+    for name, n in reversed(counts):
+        if need <= 0:
+            break
+        stack = read_stack(os.path.join(folder, name))
+        frames.insert(0, stack[-need:])
+        need -= len(stack[-need:])
+    return np.concatenate(frames, axis=0)
+
+
 def background_removal(im_folder, save_folder=None, num=100):
+    """Subtract the per-pixel minimum of every `num` consecutive frames.
+
+    Each input file (a single image or a multi-frame tif) is decomposed into frames and written
+    back as one multi-frame tif named <name>_br.tif in save_folder.
+    """
     if save_folder is None:
         save_folder = im_folder + '_br'  # where to save the images after background removal
     os.makedirs(os.path.dirname(os.path.normpath(save_folder)), exist_ok=True)
 
     if os.path.exists(save_folder) and len(os.listdir(save_folder)) > 0:
         print('probably has been done!')
-    else:
-        if not os.path.exists(save_folder):
-            os.makedirs(save_folder)
+        return save_folder
+    if num <= 0:
+        raise ValueError('num must be a positive integer.')
+    im_files = list_image_files(im_folder)
+    if len(im_files) == 0:
+        raise ValueError(f'No supported image files found in: {im_folder}')
+    os.makedirs(save_folder, exist_ok=True)
 
-        if num <= 0:
-            raise ValueError('num must be a positive integer.')
-
-        # Read only real image files to avoid passing folders to skimage.io.imread.
-        valid_exts = {'.tif', '.tiff', '.png', '.jpg', '.jpeg', '.bmp'}
-        im_files = sorted([
-            name for name in os.listdir(im_folder)
-            if os.path.isfile(os.path.join(im_folder, name))
-            and os.path.splitext(name)[1].lower() in valid_exts
-        ])
-
-        n_ims = len(im_files)
-
-        if n_ims == 0:
-            raise ValueError(f'No supported image files found in: {im_folder}')
-
-        # Process in chunks and subtract per-pixel minimum in each chunk.
-        for start in range(0, n_ims, num):
-            im_names = im_files[start:start + num]
-            im_stack = np.array([io.imread(os.path.join(im_folder, name)) for name in im_names])
-            im_stack = im_stack - np.min(im_stack, axis=0)
-
-            for j, im_name in enumerate(im_names):
-                io.imsave(os.path.join(save_folder, im_name), im_stack[j], check_contrast=False)
+    for name in tqdm(im_files, desc='Background removal'):
+        stack = read_stack(os.path.join(im_folder, name))
+        out = np.empty_like(stack)
+        for start in range(0, len(stack), num):  # chunks of `num` frames, minimum map per chunk
+            chunk = stack[start:start + num]
+            out[start:start + num] = chunk - np.min(chunk, axis=0)
+        tifffile.imwrite(os.path.join(save_folder, os.path.splitext(name)[0] + '_br.tif'), out)
 
     return save_folder
 
@@ -340,9 +400,8 @@ def mu_std_p(param_dict, noise_dict):
     snr_roi = noise_dict['snr_roi']
     max_pv = noise_dict['max_pv']
 
-    im_names = sorted(os.listdir(im_br_folder))
-    im_names = im_names[-num:]  # at the end of the video, probably with sparse molecules. It's ok if num>len(im_names)
-    ims = np.array([io.imread(os.path.join(im_br_folder, im_name)) for im_name in im_names])
+    # last `num` frames: at the end of the video, probably with sparse molecules. It's ok if num > total frames
+    ims = read_last_frames(im_br_folder, num)
 
     ims = ims[:, snr_roi[0]:snr_roi[2], snr_roi[1]:snr_roi[3]]
 
@@ -594,9 +653,8 @@ def inference_func1(param_dict, test_idx, fig_flag=True):  # simulation and try 
         print(f'Network inference on simulated an image: {sim_file}')
 
     exp_imgs_path = param_dict['im_br_folder']
-    img_names = sorted(os.listdir(exp_imgs_path))
 
-    im = io.imread(os.path.join(exp_imgs_path, img_names[test_idx])).astype(np.float32)  # read the test image
+    im = read_frame(exp_imgs_path, test_idx).astype(np.float32)  # read the test frame (global index)
     if param_dict['project_01']:
         im = ((im - im.min()) / (im.max() - im.min())).astype(np.float32)
     with torch.no_grad():
@@ -673,20 +731,19 @@ def inference_func2(param_dict):
     volume2xyz = Volume2XYZ(param_dict)
 
     exp_imgs_path = param_dict['im_br_folder']
-    img_names = sorted(os.listdir(exp_imgs_path))
-    num_imgs = len(img_names)
+    num_imgs = sum(n for _, n in frame_counts(exp_imgs_path))
 
     tall_start = time.time()
     results = np.array(['frame', 'x [nm]', 'y [nm]', 'z [nm]', 'intensity [au]'])
     with torch.no_grad():
         net.eval()
-        for im_ind, im_name in enumerate(img_names):
+        for im_ind, im_raw in iter_frames(exp_imgs_path):
             # print current image number
             print('Processing Image [%d/%d]' % (im_ind + 1, num_imgs))
 
             tfrm_start = time.time()
 
-            im = io.imread(os.path.join(exp_imgs_path, im_name)).astype(np.float32)
+            im = im_raw.astype(np.float32)
             if param_dict['project_01']:
                 im = ((im - im.min()) / (im.max() - im.min())).astype(np.float32)
             vol = net(torch.from_numpy(im[np.newaxis, np.newaxis, :, :]).to(device))
