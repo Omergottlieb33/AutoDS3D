@@ -392,6 +392,253 @@ def background_removal(im_folder, save_folder=None, num=100):
 
     return save_folder
 
+def iter_sampled_frames(folder, n=6000):
+    """Yield (global frame indices, frames) per file for about n frames spread evenly over the folder."""
+    counts = frame_counts(folder)
+    total = sum(c for _, c in counts)
+    wanted = np.unique(np.linspace(0, total - 1, min(n, total)).astype(int))
+    start = 0
+    for name, c in counts:
+        local = wanted[(wanted >= start) & (wanted < start + c)] - start
+        start += c
+        if len(local) == 0:
+            continue
+        path = os.path.join(folder, name)
+        if name.lower().endswith(('.tif', '.tiff')) and c > 1:
+            sel = tifffile.imread(path, key=local.tolist())  # reads only these pages
+            sel = sel[np.newaxis] if sel.ndim == 2 else sel
+        else:
+            sel = read_stack(path)[local]
+        yield local + start - c, sel.astype(np.float32)
+
+
+def blob_peaks(im, thr, size=9):
+    """Values of the local maxima (in a size x size window) above thr."""
+    return im[(ndimage.maximum_filter(im, size=size) == im) & (im > thr)]
+
+
+def smooth3(x):
+    """3x3 mean filter over the last two axes: lowers the noise ~3x, keeps the emitter peaks."""
+    return ndimage.uniform_filter(x, size=(1,) * (x.ndim - 2) + (3, 3))
+
+
+def calibrate_nsig(param_dict, n_exp_frames=6000, n_sim_images=60, max_peaks_per_frame=60, disturbance_margin=150,
+                   save_dir=None, verbose=True):
+    """Find the photon range Nsig_range whose simulated emitter peaks match the experiment.
+
+    Emitter peaks (local maxima of the 3x3-smoothed image above the noise) are collected from
+    background-removed experimental frames and from simulated images (same PSF, blur, noise and
+    density settings as the training data). Photons only scale the emitter signal, so the sample
+    images are built once (per-emitter blurred PSFs and noise are fixed) and every candidate range
+    is re-evaluated cheaply; the range is found by minimizing the distance between the peak
+    quantiles of the simulation and the experiment. The result is verified with the full imaging model.
+
+    A frame contributes at most max_peaks_per_frame (random) peaks, and peaks far above the bulk
+    (> 5x the median: aggregates, saturation) are ignored. Disturbances are left out: frames whose
+    max pixel jumps above 3x the typical max of frames with emitters, +- disturbance_margin frames. param_dict needs the training settings (see prepare_training_params),
+    'im_br_folder' and an initial 'Nsig_range'. Returns (Nsig_range, info); Nsig_range is None when
+    the experiment shows too few emitters to calibrate.
+    """
+    from scipy.optimize import minimize
+    device = param_dict['device']
+
+    # experiment: noise level from the first chunk, then emitter peaks over the whole sequence
+    cand, frame_idx, frame_max, thr = [], [], [], None  # cand: (global frame index, frame, peaks)
+    rng_exp = np.random.default_rng(0)
+    for gidx, chunk in iter_sampled_frames(param_dict['im_br_folder'], n_exp_frames):
+        sm = smooth3(chunk)
+        if thr is None:
+            bg_mu = float(np.median(chunk))
+            sm_mu = float(np.median(sm))
+            sm_sd = float(1.4826 * np.median(np.abs(sm - sm_mu)))  # robust: emitters hardly move it
+            thr = sm_mu + 12 * sm_sd  # well above the noise peaks (they fall off quickly beyond ~9 sigma)
+        frame_idx.append(gidx)
+        frame_max.append(chunk.max(axis=(1, 2)))
+        for i in np.where(sm.max(axis=(1, 2)) > thr)[0]:
+            p = blob_peaks(sm[i], thr)
+            if len(p) > max_peaks_per_frame:  # dense frame: a random subset, so no single frame dominates
+                p = rng_exp.choice(p, max_peaks_per_frame, replace=False)
+            cand.append((gidx[i], chunk[i], p))
+    frame_idx, frame_max = np.concatenate(frame_idx), np.concatenate(frame_max)
+
+    # disturbances (e.g. room light): frames whose max jumps far above that of ordinary frames with
+    # emitters; they and their neighbours (onset, afterglow) are left out
+    m0 = float(np.median(frame_max))  # max of a frame with noise only
+    s0 = max(float(1.4826 * np.median(np.abs(frame_max - m0))), 1.0)
+    sig = frame_max > m0 + 6 * s0
+    ceiling = 3 * float(np.median(frame_max[sig])) if sig.any() else np.inf
+    jumps = frame_idx[frame_max > ceiling]
+    def disturbed(i):
+        return len(jumps) > 0 and np.min(np.abs(jumps - i)) <= disturbance_margin
+    runs = np.split(jumps, np.where(np.diff(jumps) > 2 * disturbance_margin)[0] + 1) if len(jumps) else []
+    disturbances = [(int(r[0]) - disturbance_margin, int(r[-1]) + disturbance_margin) for r in runs]
+    if verbose and disturbances:
+        print(f'Nsig calibration: frame max jumps above {ceiling:.0f} (typical {m0:.0f} without, '
+              f'{ceiling / 3:.0f} with emitters); left out frames {disturbances}')
+
+    kept_frames = [f for g, f, _ in cand if not disturbed(g)]
+    exp_peaks_per_frame = [p for g, _, p in cand if not disturbed(g)]
+    exp_peaks = np.concatenate(exp_peaks_per_frame) if exp_peaks_per_frame else np.empty(0)
+    if len(exp_peaks) >= 30:  # drop rare very bright events far above the bulk
+        exp_peaks = exp_peaks[exp_peaks <= 5 * np.median(exp_peaks)]
+    if len(exp_peaks) < 30:
+        print(f'Nsig calibration skipped: only {len(exp_peaks)} emitter peaks (> {thr:.0f}, 3x3-smoothed) '
+              f'in {len(frame_idx)} frames outside disturbances.')
+        return None, dict(thr=thr, disturbances=disturbances, frame_idx=frame_idx, frame_max=frame_max)
+
+    qs = np.array([0.5, 0.75, 0.9])  # upper quantiles: the lowest peaks sit at the threshold, mixed with the noise tail
+    q_exp = np.quantile(exp_peaks, qs)
+
+    model = ImModelTraining(param_dict)
+    sampling = Sampling(param_dict)
+    rng_state, torch_state = np.random.get_state(), torch.get_rng_state()
+    np.random.seed(0)
+    torch.manual_seed(0)
+
+    # photon-independent parts of the sample images: A = sum_i E_i, B = sum_i u_i E_i with E_i the
+    # blurred unit-photon PSF of emitter i and N_i = lo + (hi - lo) * u_i;  im = shot noise(lo*A + (hi-lo)*B) + readout noise
+    A, B, noise = [], [], []
+    base_lo, base_hi = param_dict['Nsig_range']
+    sampling.Nsig_range = (int(base_lo), int(base_hi))
+    with torch.no_grad():
+        for _ in range(n_sim_images):
+            xyzps, _, _ = sampling.xyzp_batch()
+            n_em = xyzps.shape[0]
+            unit = np.c_[xyzps[:, :3], np.ones(n_em)]
+            psfs = model.get_psfs(torch.from_numpy(unit).to(device))
+            kernels = model.blur_kernels(n_em).unsqueeze(1)
+            blurred = F.conv2d(psfs.unsqueeze(0), kernels, padding='same', groups=n_em).squeeze(0).cpu().numpy()
+            u = np.random.rand(n_em)
+            A.append(blurred.sum(0))
+            B.append(np.tensordot(u, blurred, axes=1))
+            # readout noise exactly as in ImModelTraining.forward (does not depend on photons)
+            bl = model.baseline[0] + np.random.rand() * (model.baseline[1] - model.baseline[0])
+            rs = model.read_std[0] + np.random.rand() * (model.read_std[1] - model.read_std[0])
+            if model.non_uniform_noise_flag:
+                std = model.non_uniform_noise().cpu().numpy() * np.random.rand() * (model.read_std[1] - rs) + rs
+            else:
+                std = rs
+            noise.append(np.round(bl + np.random.randn(*A[-1].shape) * std))
+    A, B, noise = np.array(A), np.array(B), np.array(noise)
+    z_shot = np.random.randn(*A.shape).astype(np.float32)  # fixed draws -> every candidate sees the same noise
+
+    def simulate(lo, hi):
+        clean = np.clip(lo * A + (hi - lo) * B, 0, None)
+        # shot noise: Poisson where the signal is a few photons, Gaussian where it is large, none (< 1 photon) elsewhere
+        shot = clean.copy()
+        mid = (clean > 1) & (clean <= 30)
+        shot[mid] = np.random.default_rng(0).poisson(clean[mid])
+        big = clean > 30
+        shot[big] += np.sqrt(clean[big]) * z_shot[big]
+        return np.clip(shot + noise, 0, None).astype(np.float32)
+
+    def sim_quantiles(ims):
+        sm = smooth3(ims)
+        peaks = np.concatenate([blob_peaks(s, thr) for s in sm])
+        return (np.quantile(peaks, qs) if len(peaks) >= 10 else None), peaks
+
+    def loss(x):
+        lo, hi = np.exp(x)
+        if lo >= hi or lo < 100:
+            return 1e3
+        q, _ = sim_quantiles(simulate(lo, hi))
+        if q is None:
+            return 1e2
+        return float(np.mean((np.log(np.maximum(q - sm_mu, 1)) - np.log(q_exp - sm_mu)) ** 2))
+
+    x0 = np.log([base_lo, base_hi])
+    best = None
+    history = []
+    for start in (x0, x0 + np.log(0.25), x0 + np.log(0.1)):  # restart at smaller scales only if the fit is poor
+        res = minimize(loss, start, method='Nelder-Mead', options=dict(xatol=0.02, fatol=1e-3, maxfev=80))
+        history.append(dict(lo=float(np.exp(res.x[0])), hi=float(np.exp(res.x[1])), err=float(np.sqrt(res.fun)), nfev=int(res.nfev)))
+        if best is None or res.fun < best.fun:
+            best = res
+        if best.fun < 0.05:  # rms log error < ~0.22
+            break
+
+    nsig = (float(np.round(np.exp(best.x[0]) / 100) * 100), float(np.round(np.exp(best.x[1]) / 100) * 100))
+
+    # verification with the full imaging model (random blur, noise, emitters), as the training data will be made
+    np.random.seed(1)
+    torch.manual_seed(1)
+    sampling.Nsig_range = (int(nsig[0]), int(nsig[1]))
+    ims = []
+    with torch.no_grad():
+        for _ in range(n_sim_images):
+            xyzps, _, _ = sampling.xyzp_batch()
+            ims.append(model(torch.from_numpy(xyzps).to(device)).cpu().numpy().astype(np.float32))
+    ims = np.array(ims)
+    q_sim, sim_peaks = sim_quantiles(ims)
+    np.random.set_state(rng_state)
+    torch.set_rng_state(torch_state)
+    err = float(np.max(np.abs(np.log((q_sim - sm_mu) / (q_exp - sm_mu))))) if q_sim is not None else np.inf
+    if verbose:
+        print(f'Nsig calibration: Nsig_range = ({nsig[0]:.0f}, {nsig[1]:.0f}) from {len(exp_peaks)} experimental peaks '
+              f'(3x3-smoothed, > {thr:.0f}); quantiles {qs.tolist()}\n'
+              f'  experiment {np.round(q_exp).tolist()}\n'
+              f'  simulation {np.round(q_sim).tolist() if q_sim is not None else None} (max log-ratio error {err:.2f})')
+    info = dict(bg_mu=bg_mu, thr=thr, err=err, history=history, n_exp_peaks=len(exp_peaks),
+                n_sim_peaks=len(sim_peaks), q_exp=q_exp, q_sim=q_sim, disturbances=disturbances)
+    if save_dir is not None:
+        save_nsig_overlay(save_dir, np.array(kept_frames), exp_peaks, sim_peaks, thr, nsig, err, ims,
+                          frame_idx, frame_max, ceiling, disturbances)
+    return nsig, info
+
+
+def save_nsig_overlay(save_dir, exp_frames, exp_peaks, sim_peaks, thr, nsig, err, sim_ims,
+                      frame_idx, frame_max, ceiling, disturbances):
+    """Save histograms of the simulation over the experiment (jpg) and RGB image overlays (tif).
+
+    exp_frames: background-removed experimental frames that contain sparse emitters; sim_ims: simulated images.
+    """
+    vmax = float(np.quantile(exp_peaks, 0.99))
+    fig, ax = plt.subplots(1, 4, figsize=(22, 4.5))
+    hi_edge = max(float(np.quantile(exp_frames, 0.9999)), vmax, 100.0)
+    bins = np.linspace(0, hi_edge, 80)
+    ax[0].hist(np.clip(exp_frames.ravel(), 0, hi_edge), bins=bins, density=True, alpha=0.55, log=True,
+               label='experiment (br, frames with emitters)')
+    ax[0].hist(np.clip(sim_ims.ravel(), 0, hi_edge), bins=bins, density=True, alpha=0.55, log=True, label='simulated')
+    ax[0].set_title('pixel values')
+    ax[0].legend(fontsize=7)
+    pbins = np.linspace(0, max(float(np.quantile(exp_peaks, 0.99)) * 1.3, thr * 1.5), 60)
+    ax[1].hist(np.clip(exp_peaks, 0, pbins[-1]), bins=pbins, density=True, alpha=0.55, label='experiment')
+    ax[1].hist(np.clip(sim_peaks, 0, pbins[-1]), bins=pbins, density=True, alpha=0.55, label='simulated')
+    ax[1].set_title(f'emitter peaks of the 3x3-smoothed image (> {thr:.0f})')
+    ax[1].legend(fontsize=7)
+    ax[2].imshow(np.clip(sim_ims[0], 0, hi_edge), cmap='gray')
+    ax[2].set_title(f'a simulated image (Nsig_range = {nsig[0]:.0f}, {nsig[1]:.0f}; quantile error {err:.2f})', fontsize=9)
+    ax[2].axis('off')
+    ax[3].plot(frame_idx, frame_max, '.', ms=2)
+    for a, b in disturbances:
+        ax[3].axvspan(a, b, color='r', alpha=0.25)
+    if np.isfinite(ceiling):
+        ax[3].axhline(ceiling, color='r', ls='--', lw=1)
+    ax[3].set_yscale('log')
+    ax[3].set_xlabel('frame')
+    ax[3].set_title('frame max (red: disturbances left out)')
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'nsig_calibration.jpg'), dpi=120)
+    plt.close(fig)
+
+    # overlays: an experimental crop with an emitter (green) under a simulated image (magenta), same intensity scale
+    rng = np.random.default_rng(0)
+    H, W = sim_ims.shape[1:]
+    rgb = []
+    for k in range(min(5, len(exp_frames), len(sim_ims))):
+        f = exp_frames[rng.integers(len(exp_frames))]
+        r, c = np.unravel_index(np.argmax(smooth3(f)), f.shape)
+        r0 = int(np.clip(r - H // 2, 0, max(f.shape[0] - H, 0)))
+        c0 = int(np.clip(c - W // 2, 0, max(f.shape[1] - W, 0)))
+        crop = f[r0:r0 + H, c0:c0 + W]
+        crop = np.pad(crop, ((0, H - crop.shape[0]), (0, W - crop.shape[1])))
+        g = np.clip(crop / hi_edge, 0, 1)
+        m = np.clip(sim_ims[k] / hi_edge, 0, 1)
+        rgb.append((np.stack([m, g, m], axis=-1) * 255).astype(np.uint8))
+    if rgb:
+        tifffile.imwrite(os.path.join(save_dir, 'nsig_overlay.tif'), np.stack(rgb), photometric='rgb')
+
+
 def mu_std_p(param_dict, noise_dict):
 
     im_br_folder = param_dict['im_br_folder']

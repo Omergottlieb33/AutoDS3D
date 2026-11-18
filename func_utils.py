@@ -1,6 +1,6 @@
 
 from app_utils import (phase_retrieval, background_removal, mu_std_p, training_data_func, training_func,
-                       inference_func1, inference_func2)
+                       inference_func1, inference_func2, calibrate_nsig)
 from app_utils import show_z_psf, read_frame
 import numpy as np
 import torch
@@ -45,6 +45,43 @@ def br_folder_path(output_dir, raw_image_folder):
     """
     raw_name = os.path.basename(resolve_path(raw_image_folder))
     return os.path.join(output_dir, raw_name + '_br')
+
+
+def prepare_training_params(param_dict, training_im_size, num_z_voxel, us_factor, max_num_particles,
+                            projection_01, num_training_images):
+    """Fill param_dict with the simulation/training settings taken from the GUI (needs output_dir set)."""
+    param_dict['H'] = int(training_im_size)
+    param_dict['W'] = int(training_im_size)
+    param_dict['D'] = int(num_z_voxel)
+    param_dict['us_factor'] = int(us_factor)
+    param_dict['psf_half_size'] = 10  # pixels
+    param_dict['num_particles_range'] = [1, int(max_num_particles)]
+    param_dict['blob_r'] = 2
+    param_dict['blob_sigma'] = 0.65
+    param_dict['blob_maxv'] = 1000   # maximum value of network output
+
+    param_dict['non_uniform_noise_flag'] = True
+
+    param_dict['bitdepth'] = 16
+
+    param_dict['HH'] = int(param_dict['H'] * us_factor)  # in case upsampling is needed
+    param_dict['WW'] = int(param_dict['W'] * us_factor)
+    param_dict['buffer_HH'] = int(param_dict['psf_half_size'] * us_factor)
+    param_dict['buffer_WW'] = int(param_dict['psf_half_size'] * us_factor)
+
+    param_dict['ps_xy'] = param_dict['ps_camera'] / param_dict['M']
+    vs_xy = param_dict['ps_camera'] / param_dict['M'] / us_factor  # index of each voxel is at the center of the voxel
+    vs_z = ((param_dict['zrange'][1] - param_dict['zrange'][0]) / param_dict['D'])   # no buffer zone in z axis
+    param_dict['vs_xy'] = vs_xy
+    param_dict['vs_z'] = vs_z
+
+    param_dict['td_folder'] = os.path.join(param_dict['output_dir'], 'training_data', "gui")  # where to save the training data
+    if projection_01 == 0:
+        param_dict['project_01'] = False  # seems better to not have 01 normalization
+    else:
+        param_dict['project_01'] = True
+
+    param_dict['n_ims'] = int(num_training_images)  # the number of images for training
 
 
 def func1(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, external_mask,
@@ -187,11 +224,23 @@ def func3(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, externa
             param_dict['Nsig_range'] = Nsig_range
             param_dict['bg'] = 0  # the param_dict in state will also be updated
 
+            # refine the photon range: simulate, compare the emitter peaks with the experiment, iterate
+            cal_dict = param_dict.copy()  # simulation settings are only needed for the calibration here
+            prepare_training_params(cal_dict, training_im_size, num_z_voxel, us_factor, max_num_particles,
+                                    projection_01, num_training_images)
+            nsig, cal_info = calibrate_nsig(cal_dict, save_dir=param_dict['output_dir'])
+            if nsig is not None:
+                Nsig_range = nsig
+                param_dict['Nsig_range'] = Nsig_range
+                print(f'photon count calibrated on the experiment: ({Nsig_range[0]}, {Nsig_range[1]}); '
+                      f'overlays in {param_dict["output_dir"]} (nsig_calibration.jpg, nsig_overlay.tif)')
+
             print(f'noise baseline: ({baseline[0]}, {baseline[1]})')
             print(f'noise std: ({read_std[0]}, {read_std[1]})')
             print(f'photon count: ({Nsig_range[0]}, {Nsig_range[1]})')
             return ('SNR is characterized.'
-                    f'\nMPV: {mpv}.')
+                    f'\nMPV: {mpv}.'
+                    f'\nphoton count: ({Nsig_range[0]}, {Nsig_range[1]}).')
 
 
 # training data generation
@@ -211,38 +260,8 @@ def func4(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, externa
         else:
             # update param_dict
             param_dict['output_dir'] = prepare_output_dir(output_dir)
-            param_dict['H'] = int(training_im_size)
-            param_dict['W'] = int(training_im_size)
-            param_dict['D'] = int(num_z_voxel)
-            param_dict['us_factor'] = int(us_factor)
-            param_dict['psf_half_size'] = 10  # pixels
-            param_dict['num_particles_range'] = [1, int(max_num_particles)]
-            param_dict['blob_r'] = 2
-            param_dict['blob_sigma'] = 0.65
-            param_dict['blob_maxv'] = 1000   # maximum value of network output
-
-            param_dict['non_uniform_noise_flag'] = True
-
-            param_dict['bitdepth'] = 16
-
-            param_dict['HH'] = int(param_dict['H'] * us_factor)  # in case upsampling is needed
-            param_dict['WW'] = int(param_dict['W'] * us_factor)
-            param_dict['buffer_HH'] = int(param_dict['psf_half_size'] * us_factor)
-            param_dict['buffer_WW'] = int(param_dict['psf_half_size'] * us_factor)
-
-            param_dict['ps_xy'] = param_dict['ps_camera'] / param_dict['M']
-            vs_xy = param_dict['ps_camera'] / param_dict['M'] / us_factor  # index of each voxel is at the center of the voxel
-            vs_z = ((param_dict['zrange'][1] - param_dict['zrange'][0]) / param_dict['D'])   # no buffer zone in z axis
-            param_dict['vs_xy'] = vs_xy
-            param_dict['vs_z'] = vs_z
-
-            param_dict['td_folder'] = os.path.join(param_dict['output_dir'], 'training_data', "gui")  # where to save the training data
-            if projection_01 == 0:
-                param_dict['project_01'] = False  # seems better to not have 01 normalization
-            else:
-                param_dict['project_01'] = True
-
-            param_dict['n_ims'] = int(num_training_images)  # the number of images for training
+            prepare_training_params(param_dict, training_im_size, num_z_voxel, us_factor, max_num_particles,
+                                    projection_01, num_training_images)
 
             training_data_func(param_dict)
 
