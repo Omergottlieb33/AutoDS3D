@@ -726,23 +726,59 @@ class MyDataset(Dataset):
 
         x = x[np.newaxis, :, :].astype(np.float32)
 
-        # Allocate the padded volume directly, in float32: np.zeros + np.pad used to
-        # build a float64 volume (72 MB here) and copy it, and only the small blob
-        # neighbourhoods are ever written. Freshly faulting that much memory per
-        # sample costs ~130 ms on a fragmented host, which starves the GPU.
-        y = np.zeros([s + 2 * self.r for s in self.volume_size], dtype=np.float32)
         # labels may be stored as a dict {'xyz_ids', 'blob3d'} or as a tuple (xyz_ids, blob3d)
         label = self.labels[ID]
         if isinstance(label, dict):
             xyz_ids, blob3d = label['xyz_ids'], label['blob3d']
         else:
             xyz_ids, blob3d = label[0], label[1]
-        for i in range(xyz_ids.shape[0]):
-            xidx, yidx, zidx = xyz_ids[i, 0], xyz_ids[i, 1], xyz_ids[i, 2]
-            y[zidx:zidx + 2 * self.r + 1, yidx:yidx + 2 * self.r + 1, xidx:xidx + 2 * self.r + 1] += blob3d[i]
-        y = y[self.r:-self.r, self.r:-self.r, self.r:-self.r]
+        y = labels_to_volume(xyz_ids, blob3d, self.volume_size, self.r)
 
         return x, y
+
+
+def labels_to_volume(xyz_ids, blob3d, volume_size, r):
+    """Target volume (D, HH, WW) of one image: the 3D blob of each emitter placed at its voxel."""
+    # Allocate the padded volume directly, in float32: np.zeros + np.pad used to
+    # build a float64 volume (72 MB here) and copy it, and only the small blob
+    # neighbourhoods are ever written. Freshly faulting that much memory per
+    # sample costs ~130 ms on a fragmented host, which starves the GPU.
+    y = np.zeros([s + 2 * r for s in volume_size], dtype=np.float32)
+    for i in range(xyz_ids.shape[0]):
+        xidx, yidx, zidx = xyz_ids[i, 0], xyz_ids[i, 1], xyz_ids[i, 2]
+        y[zidx:zidx + 2 * r + 1, yidx:yidx + 2 * r + 1, xidx:xidx + 2 * r + 1] += blob3d[i]
+    return y[r:-r, r:-r, r:-r]
+
+
+class SimDataset(Dataset):
+    """Training pairs simulated on the fly, from the parameters of a training set (its param.pickle).
+
+    Each call draws new emitters and noise, so no image is seen twice. The imaging model is built on
+    first use, separately in each DataLoader worker (device 'cpu' works with any number of workers;
+    a cuda device needs num_workers=0, CUDA cannot be used in forked workers).
+    """
+    def __init__(self, param_dict, n_images, device='cpu'):
+        self.param_dict = dict(param_dict, device=torch.device(device))
+        self.n_images = n_images  # images per epoch
+        self.r = param_dict['blob_r']
+        self.volume_size = (param_dict['D'], param_dict['HH'], param_dict['WW'])
+        self.model = self.sampling = None
+
+    def __len__(self):
+        return self.n_images
+
+    def __getitem__(self, index):
+        if self.model is None:
+            self.model = ImModelTraining(self.param_dict)
+            self.sampling = Sampling(self.param_dict)
+        xyzps, xyz_ids, blob3d = self.sampling.xyzp_batch()
+        with torch.no_grad():
+            im = self.model(torch.from_numpy(xyzps).to(self.param_dict['device'])).cpu().numpy()
+        x = im.astype(np.uint16).astype(np.float32)  # as written to and read back from the tif files
+        if self.param_dict.get('project_01'):  # as in training_data_func
+            x = (x - x.min()) / (x.max() - x.min())
+        y = labels_to_volume(xyz_ids, blob3d, self.volume_size, self.r)
+        return x[np.newaxis].astype(np.float32), y
 
 
 class Conv2DLeakyReLUBN(nn.Module):

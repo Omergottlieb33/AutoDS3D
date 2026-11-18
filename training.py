@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 from torch.optim import Adam, AdamW
 from DS3Dplus.training_utils import TorchTrainer
 from datetime import datetime
-from DS3Dplus.ds3d_utils import MyDataset, KDE_loss3D, Volume2XYZ, calc_jaccard_rmse
+from DS3Dplus.ds3d_utils import MyDataset, SimDataset, KDE_loss3D, Volume2XYZ, calc_jaccard_rmse
 from DS3Dplus.ds3d_utils import LON as Net
 from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR, LinearLR, SequentialLR
 import os
@@ -76,10 +76,24 @@ def get_args():
     parser.add_argument('--select_by', type=str, default='loss', choices=['loss', 'jaccard'],
                         help='Checkpoint / early-stopping criterion (jaccard needs --val_jaccard_images)')
     parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument('--simulate', action='store_true',
+                        help='Simulate new training images every epoch from data_dir/param.pickle; '
+                             'the images in x_folder_path are then used only for validation')
+    parser.add_argument('--sim_images_per_epoch', type=int, default=10000,
+                        help='Simulated training images per epoch (with --simulate)')
+    parser.add_argument('--sim_device', type=str, default='cpu',
+                        help='Device of the simulation (with --simulate); cpu runs in the DataLoader workers, '
+                             'cuda runs in the main process (num_workers 0 for the training loader)')
     args = parser.parse_args()
     if args.select_by == 'jaccard' and args.val_jaccard_images <= 0:
         parser.error('--select_by jaccard needs --val_jaccard_images > 0')
     return args
+
+
+def seed_numpy_worker(_):
+    """PyTorch reseeds torch per DataLoader worker but not numpy (emitter positions): without this,
+    the workers would simulate identical emitters."""
+    np.random.seed(torch.initial_seed() % 2 ** 32)
 
 
 def make_val_jaccard_fn(x_folder, image_ids, labels, param_dict, device, threshold, blob_r, radius=0.1):
@@ -104,7 +118,7 @@ def make_val_jaccard_fn(x_folder, image_ids, labels, param_dict, device, thresho
 def train_model(x_folder_path, data_dir, save_path, epochs, batch_size, lr, device, optimizer='adam',
                 weight_decay=0.0, scheduler='plateau', warmup_epochs=2, min_lr=1e-6, early_stopping=4,
                 grad_clip=0.0, ema_decay=0.0, val_jaccard_images=0, val_threshold=40, select_by='loss',
-                num_workers=8):
+                num_workers=8, simulate=False, sim_images_per_epoch=10000, sim_device='cpu'):
     train_args = {k: v for k, v in locals().items()}  # saved with the checkpoint
     os.makedirs(save_path, exist_ok=True)
     loader_kwargs = {'num_workers': num_workers,
@@ -125,9 +139,19 @@ def train_model(x_folder_path, data_dir, save_path, epochs, batch_size, lr, devi
     with open(os.path.join(data_dir, 'param.pickle'), 'rb') as handle:
         param_dict = pickle.load(handle)
 
-    partition = {'train': x_list[:int(
-        num_x*0.9)], 'validate': x_list[int(num_x*0.9):]}
-    train_ds = MyDataset(x_folder, partition['train'], labels)
+    if simulate:
+        # new images every epoch, from the same parameters as the saved set; the saved set validates
+        partition = {'train': [], 'validate': x_list}
+        train_ds = SimDataset(param_dict, sim_images_per_epoch, device=sim_device)
+        if sim_device.startswith('cuda'):  # CUDA cannot run in forked DataLoader workers
+            params_train.update(num_workers=0, persistent_workers=False)
+        params_train['worker_init_fn'] = seed_numpy_worker
+        print(f'Simulating {sim_images_per_epoch} training images per epoch on {sim_device}; '
+              f'validating on the {num_x} images of {x_folder}')
+    else:
+        partition = {'train': x_list[:int(
+            num_x*0.9)], 'validate': x_list[int(num_x*0.9):]}
+        train_ds = MyDataset(x_folder, partition['train'], labels)
     train_dl = DataLoader(train_ds, **params_train)
     validate_ds = MyDataset(x_folder, partition['validate'], labels)
     validate_dl = DataLoader(validate_ds, **params_validate)
