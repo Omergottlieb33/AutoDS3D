@@ -96,6 +96,26 @@ def seed_numpy_worker(_):
     np.random.seed(torch.initial_seed() % 2 ** 32)
 
 
+def label_xyz(label, param_dict):
+    """Emitter positions (microns) of one label. Tuple labels (xyz_ids, blob3d) carry no positions, so they are
+    rebuilt as Sampling.xyzp_batch made them: the sub-voxel offset is exact from two neighbouring blob values,
+    since blob(t) ~ exp(-(t - offset)^2 / 2 sigma^2) gives offset = 0.5 + sigma^2 ln(blob(1) / blob(0))."""
+    if isinstance(label, dict):
+        return label['xyzps'][:, :3]
+    xyz_ids, blob3d = label
+    r = blob3d.shape[1] // 2
+    centre = blob3d[:, r, r, r]
+    s2 = param_dict['blob_sigma'] ** 2
+    local = np.c_[0.5 + s2 * np.log(blob3d[:, r, r, r + 1] / centre),   # blob3d is indexed [n, z, y, x]
+                  0.5 + s2 * np.log(blob3d[:, r, r + 1, r] / centre),
+                  0.5 + s2 * np.log(blob3d[:, r + 1, r, r] / centre)]
+    xyz = xyz_ids + local
+    p = param_dict
+    return np.c_[(xyz[:, 0] - (p['WW'] - 1) / 2) * p['vs_xy'],
+                 (xyz[:, 1] - (p['HH'] - 1) / 2) * p['vs_xy'],
+                 (xyz[:, 2] + 0.5) * p['vs_z'] + p['zrange'][0]]
+
+
 def make_val_jaccard_fn(x_folder, image_ids, labels, param_dict, device, threshold, blob_r, radius=0.1):
     """Mean Jaccard (matching radius in microns) of a model on a fixed set of validation images."""
     decode = Volume2XYZ(dict(param_dict, device=device, threshold=threshold, blob_r=blob_r))
@@ -108,7 +128,7 @@ def make_val_jaccard_fn(x_folder, image_ids, labels, param_dict, device, thresho
             for image_id in image_ids:
                 x = skio.imread(os.path.join(x_folder, image_id)).astype(np.float32)
                 xyz_pred, _ = decode(model(torch.from_numpy(x)[None, None].to(device)))
-                jaccard, _, _, _ = calc_jaccard_rmse(labels[image_id]['xyzps'][:, :3], xyz_pred, radius)
+                jaccard, _, _, _ = calc_jaccard_rmse(label_xyz(labels[image_id], param_dict), xyz_pred, radius)
                 scores.append(jaccard)
         model.train(was_training)
         return float(np.mean(scores))
@@ -194,9 +214,6 @@ def train_model(x_folder_path, data_dir, save_path, epochs, batch_size, lr, devi
 
     val_metric_fn = None
     if val_jaccard_images > 0:
-        if not isinstance(labels[partition['validate'][0]], dict):
-            raise ValueError(f'{data_dir}/y.pickle has no emitter positions (xyzps), which --val_jaccard_images '
-                             'needs: regenerate the training data, or run without --val_jaccard_images')
         val_metric_fn = make_val_jaccard_fn(x_folder, partition['validate'][:val_jaccard_images], labels,
                                             param_dict, device, val_threshold, labels['blob_r'])
 
