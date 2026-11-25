@@ -456,6 +456,18 @@ class ImModelTraining(ImModelBase):
         self.bg_range = param_dict.get('bg_range', None)
         if self.bg_range is not None:
             self.structured_bg = StructuredBg(HW=(H, W))
+        # optional empirical background measured on the experiment (ADU, camera field of view): stacks of
+        # per-pixel mean and temporal std maps (n_maps, H, W), plus per-frame level offsets; replaces
+        # baseline/read_std when given
+        self.bg_mean_map = param_dict.get('bg_mean_map', None)
+        if self.bg_mean_map is not None:
+            self.bg_mean_map = torch.as_tensor(np.asarray(self.bg_mean_map), dtype=torch.float32, device=self.device)
+            self.bg_std_map = torch.as_tensor(np.asarray(param_dict['bg_std_map']), dtype=torch.float32, device=self.device)
+            if self.bg_mean_map.dim() == 2:
+                self.bg_mean_map, self.bg_std_map = self.bg_mean_map[None], self.bg_std_map[None]
+            assert self.bg_mean_map.shape[1] >= H and self.bg_mean_map.shape[2] >= W, "background maps smaller than the image"
+            self.bg_offsets = np.asarray(param_dict['bg_offsets'], dtype=np.float32)
+        self.last_bg = self.last_std = None  # mean background and noise std of the last image (empirical background only)
 
 
     def blur_kernels(self, Nemitters):
@@ -498,6 +510,20 @@ class ImModelTraining(ImModelBase):
             bg_amp = self.bg_range[0] + torch.rand(1).item() * (self.bg_range[1] - self.bg_range[0])
             im = im + bg_amp * self.structured_bg().to(self.device, im.dtype)
         im = torch.poisson(im)  # rounded
+
+        if self.bg_mean_map is not None:  # empirical background: a random crop of the measured maps
+            H, W = im.shape
+            k = np.random.randint(self.bg_mean_map.shape[0])
+            r0 = np.random.randint(0, self.bg_mean_map.shape[1] - H + 1)
+            c0 = np.random.randint(0, self.bg_mean_map.shape[2] - W + 1)
+            offset = float(self.bg_offsets[np.random.randint(len(self.bg_offsets))])
+            self.last_bg = self.bg_mean_map[k, r0:r0 + H, c0:c0 + W] + offset
+            std = self.bg_std_map[k, r0:r0 + H, c0:c0 + W]
+            self.last_std = std
+            im = im + torch.round(self.last_bg + torch.randn(im.shape, device=self.device) * std)
+            im[im < 0] = 0
+            im[im > 2 ** self.bitdepth - 1] = 2 ** self.bitdepth - 1
+            return im.type(torch.int32)
 
         read_baseline = self.baseline[0] + torch.rand(1, device=self.device) * (self.baseline[1] - self.baseline[0])
         read_std = self.read_std[0] + torch.rand(1, device=self.device) * (self.read_std[1] - self.read_std[0])

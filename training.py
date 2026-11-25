@@ -194,6 +194,9 @@ def train_model(x_folder_path, data_dir, save_path, epochs, batch_size, lr, devi
 
     val_metric_fn = None
     if val_jaccard_images > 0:
+        if not isinstance(labels[partition['validate'][0]], dict):
+            raise ValueError(f'{data_dir}/y.pickle has no emitter positions (xyzps), which --val_jaccard_images '
+                             'needs: regenerate the training data, or run without --val_jaccard_images')
         val_metric_fn = make_val_jaccard_fn(x_folder, partition['validate'][:val_jaccard_images], labels,
                                             param_dict, device, val_threshold, labels['blob_r'])
 

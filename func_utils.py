@@ -232,6 +232,9 @@ def func3(M, NA,  n_immersion, lamda, n_sample, f_4f, ps_camera, ps_BFP, externa
             if nsig is not None:
                 Nsig_range = nsig
                 param_dict['Nsig_range'] = Nsig_range
+                baseline, read_std = cal_info['baseline'], cal_info['read_std']  # fitted on the experiment
+                param_dict['baseline'] = baseline
+                param_dict['read_std'] = read_std
                 print(f'photon count calibrated on the experiment: ({Nsig_range[0]}, {Nsig_range[1]}); '
                       f'overlays in {param_dict["output_dir"]} (nsig_calibration.jpg, nsig_overlay.tif)')
 

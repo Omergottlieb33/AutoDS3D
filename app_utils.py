@@ -412,9 +412,10 @@ def iter_sampled_frames(folder, n=6000):
         yield local + start - c, sel.astype(np.float32)
 
 
-def blob_peaks(im, thr, size=9):
-    """Values of the local maxima (in a size x size window) above thr."""
-    return im[(ndimage.maximum_filter(im, size=size) == im) & (im > thr)]
+def blob_peaks(im, thr, size=9, det=None):
+    """Values of im at the local maxima (size x size window) of det above thr; det defaults to im."""
+    det = im if det is None else det
+    return im[(ndimage.maximum_filter(det, size=size) == det) & (det > thr)]
 
 
 def smooth3(x):
@@ -422,8 +423,84 @@ def smooth3(x):
     return ndimage.uniform_filter(x, size=(1,) * (x.ndim - 2) + (3, 3))
 
 
-def calibrate_nsig(param_dict, n_exp_frames=6000, n_sim_images=60, max_peaks_per_frame=60, disturbance_margin=150,
-                   save_dir=None, verbose=True):
+def find_disturbances(frame_idx, frame_max, margin, rule='max'):
+    """Disturbances (e.g. room light) in a movie, from one statistic per frame.
+
+    rule='max': frame_max is the frame maximum; frames above 3x the typical max of frames with emitters.
+    rule='level': frame_max is a high percentile of the frame above its background (emitters hardly move
+    it, a light leak does); frames more than 6 robust sigma above the typical value.
+    Returns ([(first, last)] frame ranges including +- margin frames, ceiling, typical value)."""
+    m0 = float(np.median(frame_max))  # typical value (noise only)
+    s0 = float(1.4826 * np.median(np.abs(frame_max - m0)))
+    if rule == 'level':
+        ceiling = m0 + 6 * max(s0, 0.5)
+    else:
+        sig = frame_max > m0 + 6 * max(s0, 1.0)
+        ceiling = 3 * float(np.median(frame_max[sig])) if sig.any() else np.inf
+    jumps = np.sort(frame_idx[frame_max > ceiling])
+    runs = np.split(jumps, np.where(np.diff(jumps) > 2 * margin)[0] + 1) if len(jumps) else []
+    return [(int(r[0]) - margin, int(r[-1]) + margin) for r in runs], ceiling, m0
+
+
+def in_ranges(idx, ranges):
+    """Boolean mask: which of the frame indices idx fall in any of the (first, last) ranges."""
+    idx = np.asarray(idx)
+    mask = np.zeros(idx.shape, bool)
+    for a, b in ranges:
+        mask |= (idx >= a) & (idx <= b)
+    return mask
+
+
+def estimate_background(folder, n_frames=1300, disturbance_margin=150, min_frames=20, block_rows=32, verbose=True):
+    """Empirical background of a raw (not background-removed) movie, one map per file (local in time).
+
+    For each file, from frames spread over it: the per-pixel temporal median and robust temporal std
+    (1.4826 MAD), in ADU. The background drifts slowly and unevenly over a long movie, so maps of the
+    whole movie would blur it. Disturbance frames are left out (frames whose 99th percentile above the
+    background jumps). Returns dict(bg_mean_map (n_files, H, W), bg_std_map (n_files, H, W),
+    bg_offsets (frame level minus its map), disturbances). Emitters are sparse in time, so the median ignores them.
+    """
+    def maps(stack):  # in row blocks, to keep memory low
+        med = np.empty(stack.shape[1:], np.float32)
+        sd = np.empty(stack.shape[1:], np.float32)
+        for r in range(0, stack.shape[1], block_rows):
+            blk = stack[:, r:r + block_rows].astype(np.float32)
+            m = np.median(blk, axis=0)
+            med[r:r + block_rows] = m
+            sd[r:r + block_rows] = 1.4826 * np.median(np.abs(blk - m), axis=0)
+        return med, sd
+
+    chunks, idx, p99 = [], [], []
+    for g, c in iter_sampled_frames(folder, n_frames):
+        c = c.astype(np.uint16)
+        m, _ = maps(c)  # provisional map of this file
+        res = c.astype(np.float32) - m
+        res -= np.median(res.reshape(len(res), -1), axis=1)[:, None, None]
+        chunks.append((g, c))
+        idx.append(g)
+        p99.append(np.percentile(res.reshape(len(res), -1), 99, axis=1))
+    disturbances, _, _ = find_disturbances(np.concatenate(idx), np.concatenate(p99), disturbance_margin, rule='level')
+
+    mean_maps, std_maps, offsets = [], [], []
+    for g, c in chunks:
+        keep = ~in_ranges(g, disturbances)
+        if keep.sum() < min_frames:
+            continue
+        m, sd = maps(c[keep])
+        mean_maps.append(m)
+        std_maps.append(sd)
+        offsets += [np.median(f.astype(np.float32) - m) for f in c[keep]]
+    mean_maps, std_maps, offsets = np.array(mean_maps), np.array(std_maps), np.array(offsets, np.float32)
+    if verbose:
+        print(f'Background: {len(mean_maps)} maps (one per file) from {sum(len(g) for g, _ in chunks)} frames, '
+              f'left out disturbances {disturbances}; mean {mean_maps.min():.0f}-{mean_maps.max():.0f} '
+              f'(median {np.median(mean_maps):.0f}), temporal std {np.percentile(std_maps, 1):.1f}-'
+              f'{np.percentile(std_maps, 99):.1f}, frame offsets {np.percentile(offsets, 1):.1f} to {np.percentile(offsets, 99):.1f}')
+    return dict(bg_mean_map=mean_maps, bg_std_map=std_maps, bg_offsets=offsets, disturbances=disturbances)
+
+
+def calibrate_nsig(param_dict, n_exp_frames=6000, n_sim_images=100, max_peaks_per_frame=60, disturbance_margin=150,
+                   fit_noise=True, save_dir=None, verbose=True):
     """Find the photon range Nsig_range whose simulated emitter peaks match the experiment.
 
     Emitter peaks (local maxima of the 3x3-smoothed image above the noise) are collected from
@@ -435,7 +512,12 @@ def calibrate_nsig(param_dict, n_exp_frames=6000, n_sim_images=60, max_peaks_per
 
     A frame contributes at most max_peaks_per_frame (random) peaks, and peaks far above the bulk
     (> 5x the median: aggregates, saturation) are ignored. Disturbances are left out: frames whose
-    max pixel jumps above 3x the typical max of frames with emitters, +- disturbance_margin frames. param_dict needs the training settings (see prepare_training_params),
+    max pixel jumps above 3x the typical max of frames with emitters, +- disturbance_margin frames.
+    With fit_noise, param_dict['baseline'] and ['read_std'] are first set from the mean and std of the
+    experimental frames without emitters (more faithful than a single background pixel).
+    Raw movies: if param_dict has an empirical background (bg_mean_map, see estimate_background), the
+    frames are compared after subtracting their file's temporal median and their own level, the
+    simulation uses the maps as background, and fit_noise is not used. param_dict needs the training settings (see prepare_training_params),
     'im_br_folder' and an initial 'Nsig_range'. Returns (Nsig_range, info); Nsig_range is None when
     the experiment shows too few emitters to calibrate.
     """
@@ -444,18 +526,34 @@ def calibrate_nsig(param_dict, n_exp_frames=6000, n_sim_images=60, max_peaks_per
 
     # experiment: noise level from the first chunk, then emitter peaks over the whole sequence
     cand, frame_idx, frame_max, thr = [], [], [], None  # cand: (global frame index, frame, peaks)
+    noise_frames = []  # (global frame index, mean, mean of squares) of frames without emitters
     rng_exp = np.random.default_rng(0)
+    bg_map = param_dict.get('bg_mean_map', None)
     for gidx, chunk in iter_sampled_frames(param_dict['im_br_folder'], n_exp_frames):
-        sm = smooth3(chunk)
+        if bg_map is None:
+            det = chunk
+            fmax = chunk.max(axis=(1, 2))
+            sm = smz = smooth3(det)
+        else:  # raw movie: remove this file's background (temporal median, local in time) and each frame's level
+            det = chunk - np.median(chunk, axis=0)
+            det = det - np.median(det.reshape(len(det), -1), axis=1)[:, None, None]
+            fmax = np.percentile(det.reshape(len(det), -1), 99, axis=1)  # level statistic for disturbances
+            # detect on the noise-normalized image: the noise varies a lot over a raw field (brighter = noisier)
+            sd_t = np.maximum(1.4826 * np.median(np.abs(det), axis=0), 0.5)
+            sm, smz = smooth3(det), smooth3(det / sd_t)
         if thr is None:
-            bg_mu = float(np.median(chunk))
-            sm_mu = float(np.median(sm))
-            sm_sd = float(1.4826 * np.median(np.abs(sm - sm_mu)))  # robust: emitters hardly move it
+            bg_mu = float(np.median(det))
+            sm_mu = float(np.median(smz))
+            sm_sd = float(1.4826 * np.median(np.abs(smz - sm_mu)))  # robust: emitters hardly move it
             thr = sm_mu + 12 * sm_sd  # well above the noise peaks (they fall off quickly beyond ~9 sigma)
         frame_idx.append(gidx)
-        frame_max.append(chunk.max(axis=(1, 2)))
-        for i in np.where(sm.max(axis=(1, 2)) > thr)[0]:
-            p = blob_peaks(sm[i], thr)
+        frame_max.append(fmax)
+        quiet = smz.max(axis=(1, 2)) <= thr
+        if quiet.any():
+            q = det[quiet].astype(np.float64)
+            noise_frames.append(np.c_[gidx[quiet], q.mean(axis=(1, 2)), (q ** 2).mean(axis=(1, 2))])
+        for i in np.where(~quiet)[0]:
+            p = blob_peaks(sm[i], thr, det=smz[i])
             if len(p) > max_peaks_per_frame:  # dense frame: a random subset, so no single frame dominates
                 p = rng_exp.choice(p, max_peaks_per_frame, replace=False)
             cand.append((gidx[i], chunk[i], p))
@@ -463,28 +561,36 @@ def calibrate_nsig(param_dict, n_exp_frames=6000, n_sim_images=60, max_peaks_per
 
     # disturbances (e.g. room light): frames whose max jumps far above that of ordinary frames with
     # emitters; they and their neighbours (onset, afterglow) are left out
-    m0 = float(np.median(frame_max))  # max of a frame with noise only
-    s0 = max(float(1.4826 * np.median(np.abs(frame_max - m0))), 1.0)
-    sig = frame_max > m0 + 6 * s0
-    ceiling = 3 * float(np.median(frame_max[sig])) if sig.any() else np.inf
-    jumps = frame_idx[frame_max > ceiling]
+    disturbances, ceiling, m0 = find_disturbances(frame_idx, frame_max, disturbance_margin,
+                                                  rule='max' if bg_map is None else 'level')
     def disturbed(i):
-        return len(jumps) > 0 and np.min(np.abs(jumps - i)) <= disturbance_margin
-    runs = np.split(jumps, np.where(np.diff(jumps) > 2 * disturbance_margin)[0] + 1) if len(jumps) else []
-    disturbances = [(int(r[0]) - disturbance_margin, int(r[-1]) + disturbance_margin) for r in runs]
+        return bool(in_ranges([i], disturbances)[0])
     if verbose and disturbances:
-        print(f'Nsig calibration: frame max jumps above {ceiling:.0f} (typical {m0:.0f} without, '
-              f'{ceiling / 3:.0f} with emitters); left out frames {disturbances}')
+        stat = 'frame max' if bg_map is None else 'frame 99th percentile above background'
+        print(f'Nsig calibration: {stat} jumps above {ceiling:.0f} (typical {m0:.0f}); left out frames {disturbances}')
 
     kept_frames = [f for g, f, _ in cand if not disturbed(g)]
     exp_peaks_per_frame = [p for g, _, p in cand if not disturbed(g)]
     exp_peaks = np.concatenate(exp_peaks_per_frame) if exp_peaks_per_frame else np.empty(0)
     if len(exp_peaks) >= 30:  # drop rare very bright events far above the bulk
         exp_peaks = exp_peaks[exp_peaks <= 5 * np.median(exp_peaks)]
+    thr_text = f'> {thr:.0f}' if bg_map is None else f'> {thr:.1f} x local noise'
     if len(exp_peaks) < 30:
-        print(f'Nsig calibration skipped: only {len(exp_peaks)} emitter peaks (> {thr:.0f}, 3x3-smoothed) '
+        print(f'Nsig calibration skipped: only {len(exp_peaks)} emitter peaks ({thr_text}, 3x3-smoothed) '
               f'in {len(frame_idx)} frames outside disturbances.')
         return None, dict(thr=thr, disturbances=disturbances, frame_idx=frame_idx, frame_max=frame_max)
+
+    # background noise of the experiment (frames without emitters, outside disturbances) -> simulation noise
+    noise_frames = np.concatenate(noise_frames) if noise_frames else np.empty((0, 3))
+    noise_frames = noise_frames[[not disturbed(g) for g in noise_frames[:, 0]]]
+    if fit_noise and bg_map is None and len(noise_frames) > 0:
+        mu = float(noise_frames[:, 1].mean())
+        sd = float(np.sqrt(noise_frames[:, 2].mean() - mu ** 2))
+        param_dict['baseline'] = (round(mu - 0.5, 2), round(mu + 0.5, 2))
+        param_dict['read_std'] = (round(0.95 * sd, 2), round(1.05 * sd, 2))
+        if verbose:
+            print(f'Noise from {len(noise_frames)} frames without emitters: mean {mu:.2f}, std {sd:.2f} -> '
+                  f'baseline {param_dict["baseline"]}, read_std {param_dict["read_std"]}')
 
     qs = np.array([0.5, 0.75, 0.9])  # upper quantiles: the lowest peaks sit at the threshold, mixed with the noise tail
     q_exp = np.quantile(exp_peaks, qs)
@@ -497,9 +603,9 @@ def calibrate_nsig(param_dict, n_exp_frames=6000, n_sim_images=60, max_peaks_per
 
     # photon-independent parts of the sample images: A = sum_i E_i, B = sum_i u_i E_i with E_i the
     # blurred unit-photon PSF of emitter i and N_i = lo + (hi - lo) * u_i;  im = shot noise(lo*A + (hi-lo)*B) + readout noise
-    A, B, noise = [], [], []
-    base_lo, base_hi = param_dict['Nsig_range']
-    sampling.Nsig_range = (int(base_lo), int(base_hi))
+    A, B, noise, sim_sd = [], [], [], []
+    # photons are not used here (unit PSFs); a fixed range keeps the drawn emitters independent of the initial guess
+    sampling.Nsig_range = (1000, 2000)
     with torch.no_grad():
         for _ in range(n_sim_images):
             xyzps, _, _ = sampling.xyzp_batch()
@@ -507,10 +613,22 @@ def calibrate_nsig(param_dict, n_exp_frames=6000, n_sim_images=60, max_peaks_per
             unit = np.c_[xyzps[:, :3], np.ones(n_em)]
             psfs = model.get_psfs(torch.from_numpy(unit).to(device))
             kernels = model.blur_kernels(n_em).unsqueeze(1)
-            blurred = F.conv2d(psfs.unsqueeze(0), kernels, padding='same', groups=n_em).squeeze(0).cpu().numpy()
+            # on the CPU: deterministic (cuDNN may pick different algorithms run to run, and the fit is flat enough
+            # for last-bit differences to move the result)
+            blurred = F.conv2d(psfs.cpu().unsqueeze(0), kernels.cpu(), padding='same', groups=n_em).squeeze(0).numpy()
             u = np.random.rand(n_em)
             A.append(blurred.sum(0))
             B.append(np.tensordot(u, blurred, axes=1))
+            if bg_map is not None:  # empirical background, as in ImModelTraining.forward, minus its mean
+                H, W = A[-1].shape
+                k = np.random.randint(bg_map.shape[0])
+                r0 = np.random.randint(0, bg_map.shape[1] - H + 1)
+                c0 = np.random.randint(0, bg_map.shape[2] - W + 1)
+                mb = bg_map[k, r0:r0 + H, c0:c0 + W] + model.bg_offsets[np.random.randint(len(model.bg_offsets))]
+                sb = param_dict['bg_std_map'][k, r0:r0 + H, c0:c0 + W]
+                noise.append(np.round(mb + np.random.randn(H, W) * sb) - mb)
+                sim_sd.append(np.maximum(sb, 0.5))
+                continue
             # readout noise exactly as in ImModelTraining.forward (does not depend on photons)
             bl = model.baseline[0] + np.random.rand() * (model.baseline[1] - model.baseline[0])
             rs = model.read_std[0] + np.random.rand() * (model.read_std[1] - model.read_std[0])
@@ -520,42 +638,45 @@ def calibrate_nsig(param_dict, n_exp_frames=6000, n_sim_images=60, max_peaks_per
                 std = rs
             noise.append(np.round(bl + np.random.randn(*A[-1].shape) * std))
     A, B, noise = np.array(A), np.array(B), np.array(noise)
+    sim_sd = np.array(sim_sd) if sim_sd else None
     z_shot = np.random.randn(*A.shape).astype(np.float32)  # fixed draws -> every candidate sees the same noise
+    floor = 0 if bg_map is None else -np.inf  # with maps the simulation is compared after removing the background
 
     def simulate(lo, hi):
         clean = np.clip(lo * A + (hi - lo) * B, 0, None)
-        # shot noise: Poisson where the signal is a few photons, Gaussian where it is large, none (< 1 photon) elsewhere
+        # shot noise: Gaussian approximation with fixed draws (>= 1 photon), so the loss changes smoothly with
+        # the photon range (redrawing Poisson numbers would reshuffle all the noise when one pixel changes)
         shot = clean.copy()
-        mid = (clean > 1) & (clean <= 30)
-        shot[mid] = np.random.default_rng(0).poisson(clean[mid])
-        big = clean > 30
-        shot[big] += np.sqrt(clean[big]) * z_shot[big]
-        return np.clip(shot + noise, 0, None).astype(np.float32)
+        sig = clean > 1
+        shot[sig] += np.sqrt(clean[sig]) * z_shot[sig]
+        return np.clip(shot + noise, floor, None).astype(np.float32)
 
-    def sim_quantiles(ims):
+    def sim_quantiles(ims, sds=None):
         sm = smooth3(ims)
-        peaks = np.concatenate([blob_peaks(s, thr) for s in sm])
+        smz = sm if sds is None else smooth3(ims / sds)
+        peaks = np.concatenate([blob_peaks(sm[k], thr, det=smz[k]) for k in range(len(sm))])
         return (np.quantile(peaks, qs) if len(peaks) >= 10 else None), peaks
 
     def loss(x):
         lo, hi = np.exp(x)
         if lo >= hi or lo < 100:
             return 1e3
-        q, _ = sim_quantiles(simulate(lo, hi))
+        q, _ = sim_quantiles(simulate(lo, hi), sim_sd)
         if q is None:
             return 1e2
-        return float(np.mean((np.log(np.maximum(q - sm_mu, 1)) - np.log(q_exp - sm_mu)) ** 2))
+        fit = float(np.mean((np.log(np.maximum(q - sm_mu, 1)) - np.log(q_exp - sm_mu)) ** 2))
+        # weak prior hi/lo ~ 3: the dim end is barely seen (below the detection threshold), so without it
+        # the lower bound drifts along a flat valley of the fit
+        return fit + 0.01 * (np.log(hi / lo) - np.log(3)) ** 2
 
-    x0 = np.log([base_lo, base_hi])
-    best = None
-    history = []
-    for start in (x0, x0 + np.log(0.25), x0 + np.log(0.1)):  # restart at smaller scales only if the fit is poor
-        res = minimize(loss, start, method='Nelder-Mead', options=dict(xatol=0.02, fatol=1e-3, maxfev=80))
-        history.append(dict(lo=float(np.exp(res.x[0])), hi=float(np.exp(res.x[1])), err=float(np.sqrt(res.fun)), nfev=int(res.nfev)))
-        if best is None or res.fun < best.fun:
-            best = res
-        if best.fun < 0.05:  # rms log error < ~0.22
-            break
+    # start from a coarse scan of the photon scale (hi = 3 lo), not from the initial guess: the fit has a flat
+    # valley, so a start-dependent optimum would change with small changes of the guess
+    grid = np.exp(np.linspace(np.log(300), np.log(3e5), 25))
+    grid_loss = [loss(np.log([g, 3 * g])) for g in grid]
+    g0 = grid[int(np.argmin(grid_loss))]
+    best = minimize(loss, np.log([g0, 3 * g0]), method='Nelder-Mead', options=dict(xatol=0.02, fatol=1e-3, maxfev=100))
+    history = [dict(grid=grid.tolist(), grid_loss=grid_loss, lo=float(np.exp(best.x[0])), hi=float(np.exp(best.x[1])),
+                    err=float(np.sqrt(best.fun)), nfev=int(best.nfev))]
 
     nsig = (float(np.round(np.exp(best.x[0]) / 100) * 100), float(np.round(np.exp(best.x[1]) / 100) * 100))
 
@@ -563,50 +684,63 @@ def calibrate_nsig(param_dict, n_exp_frames=6000, n_sim_images=60, max_peaks_per
     np.random.seed(1)
     torch.manual_seed(1)
     sampling.Nsig_range = (int(nsig[0]), int(nsig[1]))
-    ims = []
+    ims, det_ims, det_sd = [], [], []
     with torch.no_grad():
         for _ in range(n_sim_images):
             xyzps, _, _ = sampling.xyzp_batch()
-            ims.append(model(torch.from_numpy(xyzps).to(device)).cpu().numpy().astype(np.float32))
+            im = model(torch.from_numpy(xyzps).to(device)).cpu().numpy().astype(np.float32)
+            ims.append(im)
+            det_ims.append(im if bg_map is None else im - model.last_bg.cpu().numpy())
+            if bg_map is not None:
+                det_sd.append(np.maximum(model.last_std.cpu().numpy(), 0.5))
     ims = np.array(ims)
-    q_sim, sim_peaks = sim_quantiles(ims)
+    q_sim, sim_peaks = sim_quantiles(np.array(det_ims), np.array(det_sd) if det_sd else None)
     np.random.set_state(rng_state)
     torch.set_rng_state(torch_state)
     err = float(np.max(np.abs(np.log((q_sim - sm_mu) / (q_exp - sm_mu))))) if q_sim is not None else np.inf
     if verbose:
         print(f'Nsig calibration: Nsig_range = ({nsig[0]:.0f}, {nsig[1]:.0f}) from {len(exp_peaks)} experimental peaks '
-              f'(3x3-smoothed, > {thr:.0f}); quantiles {qs.tolist()}\n'
+              f'(3x3-smoothed, {thr_text}); quantiles {qs.tolist()}\n'
               f'  experiment {np.round(q_exp).tolist()}\n'
               f'  simulation {np.round(q_sim).tolist() if q_sim is not None else None} (max log-ratio error {err:.2f})')
     info = dict(bg_mu=bg_mu, thr=thr, err=err, history=history, n_exp_peaks=len(exp_peaks),
-                n_sim_peaks=len(sim_peaks), q_exp=q_exp, q_sim=q_sim, disturbances=disturbances)
+                n_sim_peaks=len(sim_peaks), q_exp=q_exp, q_sim=q_sim, disturbances=disturbances,
+                baseline=param_dict['baseline'], read_std=param_dict['read_std'])
     if save_dir is not None:
         save_nsig_overlay(save_dir, np.array(kept_frames), exp_peaks, sim_peaks, thr, nsig, err, ims,
-                          frame_idx, frame_max, ceiling, disturbances)
+                          frame_idx, frame_max, ceiling, disturbances, thr_text)
     return nsig, info
 
 
 def save_nsig_overlay(save_dir, exp_frames, exp_peaks, sim_peaks, thr, nsig, err, sim_ims,
-                      frame_idx, frame_max, ceiling, disturbances):
+                      frame_idx, frame_max, ceiling, disturbances, thr_text=None):
     """Save histograms of the simulation over the experiment (jpg) and RGB image overlays (tif).
 
-    exp_frames: background-removed experimental frames that contain sparse emitters; sim_ims: simulated images.
+    exp_frames: experimental frames that contain emitters; sim_ims: simulated images (same intensity space).
     """
     vmax = float(np.quantile(exp_peaks, 0.99))
     fig, ax = plt.subplots(1, 4, figsize=(22, 4.5))
     hi_edge = max(float(np.quantile(exp_frames, 0.9999)), vmax, 100.0)
-    bins = np.linspace(0, hi_edge, 80)
-    ax[0].hist(np.clip(exp_frames.ravel(), 0, hi_edge), bins=bins, density=True, alpha=0.55, log=True,
-               label='experiment (br, frames with emitters)')
-    ax[0].hist(np.clip(sim_ims.ravel(), 0, hi_edge), bins=bins, density=True, alpha=0.55, log=True, label='simulated')
+    lo_edge = min(float(np.quantile(exp_frames, 0.001)), float(np.quantile(sim_ims, 0.001)))
+    sample = np.concatenate([exp_frames.ravel()[:100000], sim_ims.ravel()[:100000]])
+    if np.all(sample == np.round(sample)):
+        # integer pixel values (ADU): bin edges between integers, a whole number of values per bin, otherwise
+        # bins narrower than 1 ADU hold no value at all and the histogram shows regular gaps
+        width = max(1, int(np.ceil((hi_edge - lo_edge) / 80)))
+        bins = np.arange(np.floor(lo_edge) - 0.5, np.ceil(hi_edge) + width, width)
+    else:
+        bins = np.linspace(lo_edge, hi_edge, 80)
+    ax[0].hist(np.clip(exp_frames.ravel(), lo_edge, hi_edge), bins=bins, density=True, alpha=0.55, log=True,
+               label='experiment (frames with emitters)')
+    ax[0].hist(np.clip(sim_ims.ravel(), lo_edge, hi_edge), bins=bins, density=True, alpha=0.55, log=True, label='simulated')
     ax[0].set_title('pixel values')
     ax[0].legend(fontsize=7)
-    pbins = np.linspace(0, max(float(np.quantile(exp_peaks, 0.99)) * 1.3, thr * 1.5), 60)
+    pbins = np.linspace(min(0.0, float(exp_peaks.min())), max(float(np.quantile(exp_peaks, 0.99)) * 1.3, thr * 1.5), 60)
     ax[1].hist(np.clip(exp_peaks, 0, pbins[-1]), bins=pbins, density=True, alpha=0.55, label='experiment')
     ax[1].hist(np.clip(sim_peaks, 0, pbins[-1]), bins=pbins, density=True, alpha=0.55, label='simulated')
-    ax[1].set_title(f'emitter peaks of the 3x3-smoothed image (> {thr:.0f})')
+    ax[1].set_title(f'emitter peaks of the 3x3-smoothed image, above background ({thr_text or f"> {thr:.0f}"})')
     ax[1].legend(fontsize=7)
-    ax[2].imshow(np.clip(sim_ims[0], 0, hi_edge), cmap='gray')
+    ax[2].imshow(np.clip(sim_ims[0], lo_edge, hi_edge), cmap='gray')
     ax[2].set_title(f'a simulated image (Nsig_range = {nsig[0]:.0f}, {nsig[1]:.0f}; quantile error {err:.2f})', fontsize=9)
     ax[2].axis('off')
     ax[3].plot(frame_idx, frame_max, '.', ms=2)
@@ -616,7 +750,7 @@ def save_nsig_overlay(save_dir, exp_frames, exp_peaks, sim_peaks, thr, nsig, err
         ax[3].axhline(ceiling, color='r', ls='--', lw=1)
     ax[3].set_yscale('log')
     ax[3].set_xlabel('frame')
-    ax[3].set_title('frame max (red: disturbances left out)')
+    ax[3].set_title('disturbance statistic per frame (red: left out)')
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, 'nsig_calibration.jpg'), dpi=120)
     plt.close(fig)
@@ -632,8 +766,8 @@ def save_nsig_overlay(save_dir, exp_frames, exp_peaks, sim_peaks, thr, nsig, err
         c0 = int(np.clip(c - W // 2, 0, max(f.shape[1] - W, 0)))
         crop = f[r0:r0 + H, c0:c0 + W]
         crop = np.pad(crop, ((0, H - crop.shape[0]), (0, W - crop.shape[1])))
-        g = np.clip(crop / hi_edge, 0, 1)
-        m = np.clip(sim_ims[k] / hi_edge, 0, 1)
+        g = np.clip((crop - lo_edge) / (hi_edge - lo_edge), 0, 1)
+        m = np.clip((sim_ims[k] - lo_edge) / (hi_edge - lo_edge), 0, 1)
         rgb.append((np.stack([m, g, m], axis=-1) * 255).astype(np.uint8))
     if rgb:
         tifffile.imwrite(os.path.join(save_dir, 'nsig_overlay.tif'), np.stack(rgb), photometric='rgb')
@@ -712,7 +846,7 @@ def training_data_func(param_dict):
 
         x_name = str(i).zfill(5) + '.tif'
         io.imsave(os.path.join(x_folder, x_name), im, check_contrast=False)
-        labels_dict[x_name] = (xyz_ids, blob3d)
+        labels_dict[x_name] = {'xyz_ids': xyz_ids, 'blob3d': blob3d, 'xyzps': xyzps}
 
         if i % (ntrain // 10) == 0:
             print('Training image [%d / %d]' % (i + 1, ntrain))
